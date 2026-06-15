@@ -48,12 +48,17 @@ impl Chrome {
     pub async fn start(cfg: &ChromeConfig) -> Result<Arc<Self>, ApiError> {
         let mut builder = BrowserConfig::builder()
             .window_size(cfg.width, cfg.height)
+            // Run unsandboxed so Chromium starts as root in the container; this
+            // emits `--no-sandbox --disable-setuid-sandbox` for us.
+            .no_sandbox()
             // Container-friendly flags; headless is chromiumoxide's default.
-            .arg("--no-sandbox")
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-gpu")
-            .arg("--hide-scrollbars")
-            .arg("--force-color-profile=srgb");
+            // NOTE: chromiumoxide takes bare arg keys (no leading `--`); it
+            // stores the string verbatim and later prepends `--`, so passing
+            // `--foo` here would emit the bogus flag `----foo` and be ignored.
+            .arg("disable-dev-shm-usage")
+            .arg("disable-gpu")
+            .arg("hide-scrollbars")
+            .arg("force-color-profile=srgb");
         if let Some(bin) = &cfg.bin {
             builder = builder.chrome_executable(bin);
         }
