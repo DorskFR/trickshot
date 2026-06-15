@@ -20,6 +20,7 @@ Both endpoints share the same query params:
 | `url` | — | yes | — | page to render |
 | `width` | `w` | no | `TRICKSHOT_DEFAULT_WIDTH` | viewport width in px |
 | `height` | `h` | no | `TRICKSHOT_DEFAULT_HEIGHT` | viewport height in px |
+| `scale` | `dpr` | no | `1.0` | device pixel ratio; `2` = crisp 2x retina render (`/shot2` only) |
 | `timeout` | — | no | `TRICKSHOT_RENDER_TIMEOUT_SECS` | render timeout in seconds |
 
 `/shot2` uses Chrome for accurate image/font rendering where Servo falls short.

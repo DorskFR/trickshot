@@ -22,6 +22,9 @@ pub struct ShotParams {
     pub width: Option<u32>,
     #[serde(alias = "h")]
     pub height: Option<u32>,
+    /// Device pixel ratio (DPR). `scale=2` (alias `dpr`) yields a crisp 2x render.
+    #[serde(alias = "dpr")]
+    pub scale: Option<f64>,
     pub timeout: Option<u64>,
 }
 
@@ -35,6 +38,7 @@ pub async fn shot(
         url: params.url,
         width: params.width.unwrap_or(cfg.default_width),
         height: params.height.unwrap_or(cfg.default_height),
+        scale: params.scale.unwrap_or(1.0),
         timeout: Duration::from_secs(params.timeout.unwrap_or(cfg.render_timeout_secs)),
     };
 
@@ -61,6 +65,7 @@ pub async fn shot2(
         url: params.url,
         width: params.width.unwrap_or(cfg.default_width),
         height: params.height.unwrap_or(cfg.default_height),
+        scale: params.scale.unwrap_or(1.0),
         timeout: Duration::from_secs(params.timeout.unwrap_or(cfg.render_timeout_secs)),
     };
 

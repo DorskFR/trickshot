@@ -132,7 +132,7 @@ impl Chrome {
         let metrics = SetDeviceMetricsOverrideParams::builder()
             .width(i64::from(req.width))
             .height(i64::from(req.height))
-            .device_scale_factor(1.0)
+            .device_scale_factor(req.scale)
             .mobile(false)
             .build()
             .map_err(|e| ApiError::Internal(format!("device metrics: {e}")))?;
