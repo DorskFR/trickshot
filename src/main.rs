@@ -1,28 +1,28 @@
-//! trickshot — fast screenshot-as-API: render a URL to an image and return it.
+//! trickshot — fast screenshot-as-API backed by a pool of always-warm Servo
+//! engines driven over WebDriver.
 
 mod config;
+mod engine;
 mod error;
 mod handlers;
-mod renderer;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
 use clap::Parser;
-use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::config::Config;
-use crate::renderer::ServoRenderer;
+use crate::engine::{Pool, WorkerConfig};
 
 /// Shared application state handed to every handler.
 pub struct AppState {
     pub config: Config,
-    pub renderer: ServoRenderer,
-    pub render_slots: Arc<Semaphore>,
+    pub pool: Arc<Pool>,
 }
 
 #[tokio::main]
@@ -33,12 +33,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    tracing::info!(bind = %config.bind, servo = %config.servo_bin, "starting trickshot");
+    tracing::info!(bind = %config.bind, servo = %config.servo_bin, pool = config.pool_size, "starting trickshot");
 
-    let render_slots = Arc::new(Semaphore::new(config.max_concurrency));
-    let renderer = ServoRenderer::new(config.servo_bin.clone());
+    let worker_cfg = WorkerConfig {
+        bin: config.servo_bin.clone(),
+        width: config.default_width,
+        height: config.default_height,
+        ready_timeout: Duration::from_secs(config.worker_ready_timeout_secs),
+    };
+    let pool = Pool::start(
+        worker_cfg,
+        config.pool_size,
+        config.webdriver_base_port,
+        Duration::from_secs(config.checkout_timeout_secs),
+    )
+    .await?;
+
     let bind = config.bind.clone();
-    let state = Arc::new(AppState { config, renderer, render_slots });
+    let state = Arc::new(AppState { config, pool });
 
     let app = build_router(state);
 

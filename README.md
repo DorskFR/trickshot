@@ -1,7 +1,9 @@
 # trickshot
 
 Fast screenshot-as-API: `GET /shot?url=…` renders a page and returns the image.
-Rendering is backed by [Servo](https://servo.org) (Rust, no Chromium).
+A pool of **always-warm [Servo](https://servo.org) engines** (Rust, no Chromium)
+is driven over WebDriver, so a shot is just navigate + screenshot — no per-request
+browser startup.
 
 ## API
 
@@ -10,33 +12,39 @@ Rendering is backed by [Servo](https://servo.org) (Rust, no Chromium).
 | `GET /health` | liveness, returns `ok` |
 | `GET /shot?url=<URL>` | render `URL`, returns `image/png` |
 
-`/shot` query params: `url` (required), `w`/`width`, `h`/`height`, `dpr`/`device_pixel_ratio`, `timeout` (seconds).
+`/shot` query params: `url` (required), `w`/`width`, `h`/`height`, `timeout` (seconds).
 
 ```
-curl 'http://localhost:8900/shot?url=https://example.com&w=1280&h=900' -o shot.png
+curl 'http://localhost:8900/shot?url=https://example.com' -o shot.png
 ```
 
 ## Develop
 
 ```
 make servo   # fetch the pinned Servo nightly into vendor/
-make run      # cargo run (uses vendor/servo/servoshell)
+make run      # cargo run (boots a warm pool using vendor/servo/servoshell)
 make fmt lint test
 ```
 
 Config is via env (see `.env.example`): `TRICKSHOT_BIND`, `TRICKSHOT_SERVO_BIN`,
+`TRICKSHOT_POOL_SIZE`, `TRICKSHOT_WEBDRIVER_BASE_PORT`,
 `TRICKSHOT_DEFAULT_WIDTH/HEIGHT`, `TRICKSHOT_RENDER_TIMEOUT_SECS`,
-`TRICKSHOT_MAX_CONCURRENCY`, `RUST_LOG`.
+`TRICKSHOT_WORKER_READY_TIMEOUT_SECS`, `TRICKSHOT_CHECKOUT_TIMEOUT_SECS`, `RUST_LOG`.
 
 ## Design
 
-The HTTP layer depends only on `ServoRenderer::render() -> Result<Vec<u8>>`.
-Phase 1 drives the `servoshell` headless binary as a subprocess — one cold
-process per shot, simple and correct. `max_concurrency` caps simultaneous Servo
-processes to bound memory (each is ~300–800MB).
+On startup trickshot launches `POOL_SIZE` headless `servoshell` processes, each
+with a WebDriver server on its own port, and keeps a session open on each. A
+request checks a warm worker out of the pool, navigates, screenshots, and returns
+it. A worker that errors is killed and respawned on its port, so the pool
+self-heals without leaking a slot.
 
-Phase 2 swaps that seam for an embedded, warm renderer built on the `servo`
-crate (reuse the engine across requests, kill per-shot startup), then tunneling
-to reach services the renderer can't route to directly.
+Warm light pages return in tens of milliseconds. Heavy pages are bounded by
+Servo's software rasterizer, which is also viewport-sensitive: its headless
+screenshot degrades sharply above ~1024px wide, hence the conservative default
+viewport and a one-shot screenshot retry.
 
-Images push to `ghcr.io/dorskfr/trickshot`, tag-driven (`v*`).
+Next: tunneling to reach services the renderer can't route to directly.
+
+Images build + publish to `ghcr.io/dorskfr/trickshot` via GitHub Actions,
+tag-driven (`v*`).
