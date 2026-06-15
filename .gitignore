@@ -1,0 +1,10 @@
+/target
+/vendor
+*.png
+*.log
+.env
+.env.*
+*.swp
+
+# CLAUDE.md is ignored by the user's global gitignore; track it in this repo
+!CLAUDE.md

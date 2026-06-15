@@ -1,0 +1,13 @@
+target/
+**/target/
+vendor/
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+*.log
+*.png
+.env
+.env.*
+README.md
