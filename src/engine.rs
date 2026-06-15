@@ -137,6 +137,10 @@ impl Worker {
 
     /// Navigate to `url` and capture a screenshot as PNG bytes.
     async fn shot(&mut self, url: &Url, req: &ShotRequest) -> Result<Vec<u8>, ApiError> {
+        // Servo's headless screenshot 500s when hit mid-paint; retry this many
+        // times with growing backoff to let heavy pages settle.
+        const SCREENSHOT_ATTEMPTS: u32 = 6;
+
         // Resize only when the viewport actually changed — a redundant Set Window
         // Rect on a heavy page forces an expensive reflow.
         if req.width != self.cur_w || req.height != self.cur_h {
@@ -167,11 +171,10 @@ impl Worker {
             return Err(ApiError::Render(format!("navigate failed: HTTP {}", nav.status())));
         }
 
-        // Servo occasionally 500s a screenshot mid-paint; retry once.
         let mut last = ApiError::Render("screenshot not attempted".to_owned());
-        for attempt in 0..2 {
+        for attempt in 0..SCREENSHOT_ATTEMPTS {
             if attempt > 0 {
-                sleep(Duration::from_millis(300)).await;
+                sleep(Duration::from_millis(500 * u64::from(attempt))).await;
             }
             let shot = match self
                 .http
