@@ -18,8 +18,11 @@ ARG SERVO_URL=https://github.com/servo/servo-nightly-builds/releases/download/${
 # ca-certificates/libssl3, but servoshell links GStreamer + EGL/GBM/DRM/Wayland/X
 # and needs fonts (incl. CJK) and the Mesa software (llvmpipe) driver to render
 # headless.
+# `chromium` backs the /shot2 (CDP) endpoint; it pulls its own large dep tree
+# (it is far heavier than servoshell's libs) and brings the same font set.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl libssl3 \
+      chromium \
       fontconfig fonts-liberation fonts-noto-cjk libfreetype6 \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
       libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 libgstreamer-plugins-bad1.0-0 \
@@ -39,6 +42,7 @@ RUN mkdir -p /opt/servo \
 COPY --from=builder /app/target/release/trickshot /usr/local/bin/trickshot
 
 ENV TRICKSHOT_BIND=0.0.0.0:8900 \
-    TRICKSHOT_SERVO_BIN=servoshell
+    TRICKSHOT_SERVO_BIN=servoshell \
+    TRICKSHOT_CHROME_BIN=/usr/bin/chromium
 EXPOSE 8900
 CMD ["trickshot"]

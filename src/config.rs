@@ -42,4 +42,14 @@ pub struct Config {
     /// How long a request waits for a free warm worker, in seconds.
     #[arg(long, env = "TRICKSHOT_CHECKOUT_TIMEOUT_SECS", default_value_t = 30)]
     pub checkout_timeout_secs: u64,
+
+    /// Path to (or name of) the Chrome/Chromium binary backing `/shot2`.
+    /// Unset lets chromiumoxide auto-detect a system install.
+    #[arg(long, env = "TRICKSHOT_CHROME_BIN")]
+    pub chrome_bin: Option<String>,
+
+    /// Max pages rendering concurrently in the one warm Chrome (`/shot2`).
+    /// One process, many cheap tabs, so this can exceed `pool_size`.
+    #[arg(long, env = "TRICKSHOT_CHROME_MAX_CONCURRENCY", default_value_t = 4)]
+    pub chrome_max_concurrency: usize,
 }

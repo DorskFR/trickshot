@@ -1,6 +1,7 @@
 //! trickshot — fast screenshot-as-API backed by a pool of always-warm Servo
 //! engines driven over WebDriver.
 
+mod chrome;
 mod config;
 mod engine;
 mod error;
@@ -16,6 +17,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use crate::chrome::{Chrome, ChromeConfig};
 use crate::config::Config;
 use crate::engine::{Pool, WorkerConfig};
 
@@ -23,6 +25,7 @@ use crate::engine::{Pool, WorkerConfig};
 pub struct AppState {
     pub config: Config,
     pub pool: Arc<Pool>,
+    pub chrome: Arc<Chrome>,
 }
 
 #[tokio::main]
@@ -49,8 +52,16 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    let chrome_cfg = ChromeConfig {
+        bin: config.chrome_bin.clone(),
+        width: config.default_width,
+        height: config.default_height,
+        max_concurrency: config.chrome_max_concurrency,
+    };
+    let chrome = Chrome::start(&chrome_cfg).await?;
+
     let bind = config.bind.clone();
-    let state = Arc::new(AppState { config, pool });
+    let state = Arc::new(AppState { config, pool, chrome });
 
     let app = build_router(state);
 
@@ -64,6 +75,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handlers::health))
         .route("/shot", get(handlers::shot))
+        .route("/shot2", get(handlers::shot2))
         // Per-request access log; enable with `tower_http=debug` in RUST_LOG.
         .layer(TraceLayer::new_for_http())
         .with_state(state)
