@@ -253,7 +253,7 @@ impl Pool {
             return Err(ApiError::BadRequest("only http(s) urls are allowed".to_owned()));
         }
 
-        let mut worker = match timeout(self.checkout_timeout, self.rx.recv()).await {
+        let worker = match timeout(self.checkout_timeout, self.rx.recv()).await {
             Ok(Ok(worker)) => worker,
             Ok(Err(_)) => return Err(ApiError::Internal("worker pool closed".to_owned())),
             Err(_) => {
@@ -261,28 +261,59 @@ impl Pool {
             }
         };
 
+        // Hold the checked-out worker in a guard so that *any* early exit from
+        // here on — an error, or the request future being dropped when the
+        // client disconnects mid-render — recycles the slot instead of leaking
+        // it. Without this, a cancelled slow render permanently drains the pool.
+        let mut guard =
+            WorkerGuard { worker: Some(worker), tx: self.tx.clone(), cfg: self.cfg.clone() };
+        let worker = guard.worker.as_mut().expect("worker present");
         let port = worker.port;
+
         match worker.shot(&url, req).await {
             Ok(bytes) => {
+                // Healthy engine: defuse the guard and return it to the pool as-is.
+                let worker = guard.worker.take().expect("worker present");
                 let _ = self.tx.send(worker).await;
                 Ok(bytes)
             }
             Err(err) => {
-                // The session may be in an unknown state; recycle the worker.
+                // The session may be in an unknown state; let the guard recycle it.
                 tracing::warn!(port, error = %err, "worker shot failed; recycling");
-                worker.shutdown().await;
-                // Give the OS a moment to release the WebDriver port.
-                sleep(Duration::from_millis(300)).await;
-                match Worker::spawn(&self.cfg, port).await {
-                    Ok(fresh) => {
-                        let _ = self.tx.send(fresh).await;
-                    }
-                    Err(spawn_err) => {
-                        tracing::error!(port, error = %spawn_err, "respawn failed; pool reduced");
-                    }
-                }
                 Err(err)
             }
         }
+    }
+}
+
+/// RAII handle for a checked-out worker. If still holding the worker when
+/// dropped (error or cancellation), it recycles the slot on a detached task:
+/// the possibly-wedged engine is killed and a fresh one respawned on its port,
+/// so the pool self-heals and never leaks a slot.
+struct WorkerGuard {
+    worker: Option<Worker>,
+    tx: async_channel::Sender<Worker>,
+    cfg: WorkerConfig,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.take() else { return };
+        let tx = self.tx.clone();
+        let cfg = self.cfg.clone();
+        let port = worker.port;
+        tokio::spawn(async move {
+            worker.shutdown().await;
+            // Give the OS a moment to release the WebDriver port.
+            sleep(Duration::from_millis(300)).await;
+            match Worker::spawn(&cfg, port).await {
+                Ok(fresh) => {
+                    let _ = tx.send(fresh).await;
+                }
+                Err(err) => {
+                    tracing::error!(port, error = %err, "respawn after recycle failed; pool reduced");
+                }
+            }
+        });
     }
 }
