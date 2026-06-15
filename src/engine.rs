@@ -16,6 +16,8 @@ pub struct ShotRequest {
     pub url: String,
     pub width: u32,
     pub height: u32,
+    /// Device pixel ratio (DPR). 1.0 = standard, 2.0 = crisp "retina" 2x render.
+    pub scale: f64,
     pub timeout: Duration,
 }
 
