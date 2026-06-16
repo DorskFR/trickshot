@@ -2,15 +2,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Json, Path, Query, Request, State};
 use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::chrome::ShotRequest;
 use crate::error::ApiError;
+use crate::keys::{KeyInfo, Role};
 use crate::{AppState, ssrf, tunnel};
 
 pub async fn health() -> &'static str {
@@ -46,21 +47,35 @@ pub async fn require_api_key(
         .ok_or_else(|| ApiError::Unauthorized("missing api key".into()))?;
 
     match state.keys.verify(&presented) {
-        Some((id, label)) => {
-            tracing::info!(key_id = %id, key_label = %label, "authenticated request");
-            // Stash the matched key id so downstream handlers (e.g. /tunnel)
-            // can attribute the tunnel to the caller.
-            request.extensions_mut().insert(AuthedKey(id));
+        Some((id, label, role)) => {
+            tracing::info!(key_id = %id, key_label = %label, %role, "authenticated request");
+            // Stash the matched key id/role so downstream handlers (e.g.
+            // /tunnel, the admin guard) can read them.
+            request.extensions_mut().insert(AuthedKey { id, role });
             Ok(next.run(request).await)
         }
         None => Err(ApiError::Unauthorized("invalid api key".into())),
     }
 }
 
-/// The authenticated key id, injected into request extensions by
-/// [`require_api_key`] so downstream handlers can read it.
+/// Axum middleware guarding `/admin/*`: runs *after* [`require_api_key`] and
+/// rejects any key whose role is not `admin` with 403. The distinction from
+/// 401 is intentional: a valid render key is authenticated but unauthorized.
+pub async fn require_admin(request: Request, next: Next) -> Result<Response, ApiError> {
+    let role = request.extensions().get::<AuthedKey>().map(|k| k.role);
+    match role {
+        Some(Role::Admin) => Ok(next.run(request).await),
+        _ => Err(ApiError::Forbidden("insufficient permission: needs an admin key".into())),
+    }
+}
+
+/// The authenticated key id + role, injected into request extensions by
+/// [`require_api_key`] so downstream handlers can read them.
 #[derive(Clone)]
-pub struct AuthedKey(pub String);
+pub struct AuthedKey {
+    pub id: String,
+    pub role: Role,
+}
 
 /// Query parameters for `GET /shot`. Short aliases (`w`, `h`) are accepted.
 #[derive(Debug, Deserialize)]
@@ -140,8 +155,82 @@ pub async fn tunnel(
     let key_id = request
         .extensions()
         .get::<AuthedKey>()
-        .map_or_else(|| "unknown".to_string(), |k| k.0.clone());
+        .map_or_else(|| "unknown".to_string(), |k| k.id.clone());
     let tunnels = state.tunnels.clone();
     let cfg = state.config.tunnel_config();
     ws.on_upgrade(move |socket| tunnel::run(socket, tunnels, cfg, key_id))
+}
+
+// --- Admin: remote key management (admin-scoped) -----------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateKeyBody {
+    pub label: String,
+    #[serde(default)]
+    pub role: Role,
+}
+
+/// Response to `POST /admin/keys`: the public info plus the one-time secret.
+#[derive(Debug, Serialize)]
+pub struct CreatedKey {
+    #[serde(flatten)]
+    pub info: KeyInfo,
+    /// The plaintext key, returned exactly once — never retrievable again.
+    pub secret: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RoleBody {
+    pub role: Role,
+}
+
+/// `POST /admin/keys {label, role}` → create a key, returning the secret once.
+pub async fn admin_create_key(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateKeyBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (info, secret) = state.keys.create(&body.label, body.role)?;
+    tracing::info!(key_id = %info.id, role = %info.role, "admin created key");
+    Ok(Json(CreatedKey { info, secret }))
+}
+
+/// `GET /admin/keys` → list keys (no secrets).
+pub async fn admin_list_keys(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.keys.list()))
+}
+
+/// `POST /admin/keys/{id}/disable`.
+pub async fn admin_disable_key(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.keys.set_disabled(&id, true)?))
+}
+
+/// `POST /admin/keys/{id}/enable`.
+pub async fn admin_enable_key(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.keys.set_disabled(&id, false)?))
+}
+
+/// `DELETE /admin/keys/{id}`.
+pub async fn admin_delete_key(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.keys.delete(&id)?;
+    Ok(Json(serde_json::json!({"deleted": id})))
+}
+
+/// `POST /admin/keys/{id}/role {role}` → promote/demote (render⇄admin).
+pub async fn admin_set_role(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RoleBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.keys.set_role(&id, body.role)?))
 }

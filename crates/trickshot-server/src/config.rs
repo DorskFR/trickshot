@@ -62,6 +62,13 @@ pub struct Config {
     #[arg(long, env = "TRICKSHOT_KEYS_FILE", default_value = "/data/keys.json")]
     pub keys_file: PathBuf,
 
+    /// One-time bootstrap admin key. If set and the store has no enabled admin
+    /// key, this plaintext secret is seeded as the first `admin` key at startup
+    /// (so no `kubectl exec` is needed). If unset and no admin key exists, the
+    /// server mints one and logs its id + a one-time secret instead.
+    #[arg(long, env = "TRICKSHOT_BOOTSTRAP_ADMIN_KEY")]
+    pub bootstrap_admin_key: Option<String>,
+
     /// Allow rendering targets that resolve to private/reserved IP ranges
     /// (RFC1918, loopback, link-local incl. cloud metadata). Default deny.
     #[arg(long, env = "TRICKSHOT_ALLOW_PRIVATE_TARGETS", default_value_t = false)]

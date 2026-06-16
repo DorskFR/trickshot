@@ -12,6 +12,7 @@ just navigate + screenshot with no per-request browser startup.
 | `GET /health` | liveness, returns `ok` |
 | `GET /shot?url=<URL>` | render `URL` via headless Chrome (CDP), returns `image/png` |
 | `GET /tunnel` | WebSocket upgrade; opens a reverse tunnel for private/VPN URLs (auth required) |
+| `POST/GET /admin/keys`, `…/{id}/disable\|enable\|role`, `DELETE …/{id}` | remote key management (admin key required) |
 
 Query params:
 
@@ -50,18 +51,31 @@ chmod +x ts && sudo mv ts /usr/local/bin/
 Usage:
 
 ```
-export TRICKSHOT_URL=https://shot.example.com
-export TRICKSHOT_API_KEY=<key>
+# one-time: save credentials to ~/.config/trickshot/config.json
+ts auth https://shot.example.com <key> prod   # name defaults to "default"
+ts servers                                     # list (* marks the default)
+ts default prod                                # switch default
 
+# take a shot (uses the selected server's url+key)
 ts https://www.cryptact.io -w 1920 --height 1080 --dpr 2 -o shot.png
 ts https://internal.svc/dashboard --tunnel --height 1080 --dpr 2 -o shot.png
+
+# env vars override the config (handy for CI):
+TRICKSHOT_URL=https://shot.example.com TRICKSHOT_API_KEY=<key> \
+  ts https://example.com -o shot.png
 ```
+
+Credentials resolve from `TRICKSHOT_URL`/`TRICKSHOT_API_KEY` (both set → used
+directly), else `--server <name>`, else the config's default (or sole) server.
+The config file is `~/.config/trickshot/config.json` (mode `0600`), same shape
+as the `yt` CLI: `{"default":"…","servers":{"…":{"url","key"}}}`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `<URL>` | — | page to screenshot (positional, required) |
-| `--server` / `TRICKSHOT_URL` | — | trickshot server base URL |
-| `--api-key` / `TRICKSHOT_API_KEY` | — | API key, sent as `X-API-Key` |
+| `<URL>` | — | page to screenshot (positional, required for a shot) |
+| `--server <name>` | default/sole | named server from the config |
+| `--server-url` / `TRICKSHOT_URL` | config | trickshot server base URL |
+| `--api-key` / `TRICKSHOT_API_KEY` | config | API key, sent as `X-API-Key` |
 | `-w`, `--width` | server default | viewport width in px |
 | `--height` | server default | viewport height in px (no `-h` short — that's `--help`) |
 | `--dpr` (alias `--scale`) | `1.0` | device pixel ratio; long-only (a `-dpr` short would parse as `-d -p -r`) |
@@ -69,32 +83,57 @@ ts https://internal.svc/dashboard --tunnel --height 1080 --dpr 2 -o shot.png
 | `-o`, `--output` | `<host>.png` | output file, or `-` for stdout |
 | `--tunnel` | off | open a reverse tunnel for this shot |
 
-## Authentication
+## Authentication & key management
 
 `/shot` requires an API key (`/health` stays open). Present it as a header
 (`X-API-Key: <key>` or `Authorization: Bearer <key>`) or as a query param
 (`?api_key=<key>`, composes with the existing `GET /shot?url=…`). A missing or
 invalid key returns `401` with a JSON body. Keys are stored as SHA-256 hashes
-only, never plaintext; the matched key id/label is logged per request for
+only, never plaintext; the matched key id/label/role is logged per request for
 attribution.
 
 Keys live in a JSON file at `TRICKSHOT_KEYS_FILE` (default `/data/keys.json`),
 on a writable volume in the pod. The server hot-reloads the file on change and
-on `SIGHUP`, so keys can be added or revoked without a restart (fallback:
-restart the pod).
+on `SIGHUP`, so changes take effect without a restart.
 
-### Key-management CLI
+### Roles
 
-The same binary manages keys against `TRICKSHOT_KEYS_FILE`. `kubectl exec` into
-the pod and run:
+Each key has a **role**: `render` (default) or `admin`.
+
+- `render` keys may call `/shot` (and `/tunnel`).
+- `admin` keys may *also* call the `/admin/keys…` endpoints below.
+- A `render` key hitting an admin endpoint gets `403 insufficient permission`
+  (distinct from the `401` for a missing/invalid key).
+
+### Bootstrap (the first admin key — no `kubectl exec`)
+
+The first admin key is the chicken-and-egg case. On startup, if the store has
+**no enabled admin key**, the server seeds one:
+
+- If `TRICKSHOT_BOOTSTRAP_ADMIN_KEY` is set (env/secret), that value becomes the
+  first admin key.
+- Otherwise the server mints one and logs its id and a **one-time secret** to
+  stdout (`Save this secret now (shown once): …`).
+
+Grab that one secret from the pod's secret/logs **once**, then do all further
+management remotely with `ts`. No `kubectl exec` into the pod is needed.
+
+### Remote key management (`ts keys …`)
+
+Point `ts` at the server with an admin key (see `ts auth` above), then:
 
 ```
-trickshot keys create --label ci   # generates a key, prints the secret ONCE
-trickshot keys list                # id, label, created, status (never the secret)
-trickshot keys disable <id>        # revoke without deleting
-trickshot keys enable <id>
-trickshot keys delete <id>
+ts keys create --label ci [--role render|admin]  # prints the secret ONCE
+ts keys list                                      # id, label, role, created, status
+ts keys disable <id>                              # revoke without deleting
+ts keys enable <id>
+ts keys delete <id>
+ts keys promote <id>                              # render → admin
+ts keys demote <id>                               # admin → render
 ```
+
+Each maps to an `/admin/keys…` call authenticated with the admin key. Using a
+`render` key prints `insufficient permission: needs an admin key`.
 
 ## SSRF protection
 
