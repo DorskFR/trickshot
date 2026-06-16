@@ -4,8 +4,8 @@ FROM rust:1.90-slim-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-RUN cargo build --release
+COPY crates/ crates/
+RUN cargo build --release -p trickshot
 
 # ── Runtime: trickshot + the Chromium it drives over CDP ─────────────────────
 FROM debian:bookworm-slim

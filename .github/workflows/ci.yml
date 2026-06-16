@@ -17,5 +17,5 @@ jobs:
         with:
           components: rustfmt
       - run: cargo +nightly fmt --check
-      - run: cargo +stable clippy --all-targets -- -D warnings
-      - run: cargo +stable test
+      - run: cargo +stable clippy --workspace --all-targets -- -D warnings
+      - run: cargo +stable test --workspace

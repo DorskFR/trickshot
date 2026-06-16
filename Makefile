@@ -5,7 +5,7 @@ export TRICKSHOT_BIND
 # Published to GitHub Container Registry. Override IMAGE_REGISTRY to publish elsewhere.
 IMAGE_REGISTRY ?= ghcr.io/dorskfr
 IMAGE_REPO     ?= trickshot
-IMAGE_VERSION  ?= $(shell awk -F'"' '/^\[package\]/{f=1} f && /^version/{print $$2; exit}' Cargo.toml)
+IMAGE_VERSION  ?= $(shell awk -F'"' '/^\[workspace.package\]/{f=1} f && /^version/{print $$2; exit}' Cargo.toml)
 IMAGE          ?= $(IMAGE_REGISTRY)/$(IMAGE_REPO)
 
 .PHONY: build check test fmt lint clean run
@@ -14,7 +14,7 @@ IMAGE          ?= $(IMAGE_REGISTRY)/$(IMAGE_REPO)
 # ── Build ──────────────────────────────────────────────────
 
 build:  ## Build in release mode
-	cargo build --release
+	cargo build --release -p trickshot
 
 check:  ## Type check
 	cargo check
@@ -35,12 +35,12 @@ test:  ## Run tests
 # ── Run ────────────────────────────────────────────────────
 
 run:  ## Run the server locally (needs a Chrome/Chromium binary)
-	cargo run
+	cargo run -p trickshot
 
 # ── Image ──────────────────────────────────────────────────
 
 image/build:  ## Build container image tagged with the Cargo.toml version (no :latest)
-	docker build --platform linux/amd64 -f deploy/Dockerfile \
+	docker build --platform linux/amd64 -f crates/trickshot-server/deploy/Dockerfile \
 	  -t $(IMAGE):$(IMAGE_VERSION) .
 
 image/push:  ## Push the versioned image tag
