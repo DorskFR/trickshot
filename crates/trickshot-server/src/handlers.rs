@@ -19,7 +19,7 @@ pub async fn health() -> &'static str {
 }
 
 /// Extract the presented API key from (in order) `X-API-Key`,
-/// `Authorization: Bearer <key>`, or the `api_key` query param.
+/// `Authorization: Bearer <key>`, or the `api_key`/`apiKey` query param.
 fn extract_key(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
@@ -30,8 +30,10 @@ fn extract_key(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
         return Some(token.trim().to_string());
     }
     query.and_then(|q| {
+        // Accept both the snake_case `api_key` and the camelCase `apiKey`
+        // spelling so a screenshot URL can be pasted straight into a browser.
         url::form_urlencoded::parse(q.as_bytes())
-            .find(|(k, _)| k == "api_key")
+            .find(|(k, _)| k == "api_key" || k == "apiKey")
             .map(|(_, v)| v.into_owned())
     })
 }
@@ -233,4 +235,28 @@ pub async fn admin_set_role(
     Json(body): Json<RoleBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.keys.set_role(&id, body.role)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_api_key_query_param() {
+        let h = HeaderMap::new();
+        assert_eq!(extract_key(&h, Some("url=x&api_key=secret")).as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn extracts_camelcase_apikey_query_param() {
+        let h = HeaderMap::new();
+        assert_eq!(extract_key(&h, Some("url=x&apiKey=secret")).as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn header_takes_precedence_over_query() {
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "fromheader".parse().unwrap());
+        assert_eq!(extract_key(&h, Some("apiKey=fromquery")).as_deref(), Some("fromheader"));
+    }
 }
