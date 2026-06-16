@@ -16,18 +16,13 @@ use crate::error::ApiError;
 
 /// A key's permission scope. `render` keys may call `/shot` (+ `/tunnel`);
 /// `admin` keys may *also* call the `/admin/keys…` endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Role {
+    #[default]
     Render,
     Admin,
-}
-
-impl Default for Role {
-    fn default() -> Self {
-        Self::Render
-    }
 }
 
 impl std::fmt::Display for Role {
