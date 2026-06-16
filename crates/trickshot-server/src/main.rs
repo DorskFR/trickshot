@@ -15,6 +15,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use clap::Parser;
+use notify::event::EventKind;
 use notify::{RecursiveMode, Watcher};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
@@ -117,6 +118,18 @@ fn bootstrap_admin(keys: &Arc<KeyStore>, config: &Config) -> anyhow::Result<()> 
 
 /// Hot-reload the key store on SIGHUP and on file modification, so the CLI can
 /// add/revoke keys without restarting the server.
+/// Whether a notify event should trigger a key-store reload: it must touch the
+/// keys file itself (we watch the parent dir, so unrelated siblings churn too)
+/// and be a create/modify/remove — access/metadata-only noise is ignored.
+fn is_relevant_key_event(event: &notify::Event, keys_path: &std::path::Path) -> bool {
+    let touches_keys_file = event.paths.iter().any(|p| p == keys_path);
+    let meaningful = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    );
+    touches_keys_file && meaningful
+}
+
 fn spawn_key_reloaders(keys: Arc<KeyStore>) {
     // SIGHUP → reload.
     let sighup_keys = keys.clone();
@@ -136,9 +149,16 @@ fn spawn_key_reloaders(keys: Arc<KeyStore>) {
     });
 
     // File-modification watch (best-effort) → reload via a debounced channel.
+    // We watch the parent directory (so rename-into-place / atomic saves are
+    // seen) but only forward events that touch the keys file itself with a
+    // meaningful kind — k8s-mounted dirs emit a steady stream of unrelated fs
+    // events that would otherwise drive a reload every ~200ms.
+    let keys_path = keys.path().to_path_buf();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
+        if let Ok(event) = res
+            && is_relevant_key_event(&event, &keys_path)
+        {
             let _ = tx.send(());
         }
     });

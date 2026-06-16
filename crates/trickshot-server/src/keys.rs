@@ -89,6 +89,27 @@ pub fn hash_key(plaintext: &str) -> String {
     })
 }
 
+/// A content fingerprint of the key set used to detect whether a reload
+/// actually changed anything. Covers every persisted field so a no-op reload
+/// (identical on disk) is recognized and not logged.
+fn fingerprint(file: &KeyFile) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((file.keys.len() as u64).to_le_bytes());
+    for k in &file.keys {
+        hasher.update(k.id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(k.label.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(k.hash.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(k.role.to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(k.created_at.to_le_bytes());
+        hasher.update([u8::from(k.disabled)]);
+    }
+    hasher.finalize().into()
+}
+
 /// Constant-time comparison of two equal-length byte slices. Returns false for
 /// length mismatches (length is not secret here — the hash width is fixed).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -159,12 +180,22 @@ impl KeyStore {
     }
 
     /// Re-read the file from disk, replacing the in-memory view. Used on file
-    /// change / SIGHUP for revocation without a restart.
+    /// change / SIGHUP for revocation without a restart. Emits the INFO line
+    /// only when the key set actually changed; an unchanged reload (e.g. from a
+    /// spurious fs event) returns quietly so the log is not spammed.
     pub fn reload(&self) -> Result<(), ApiError> {
         let file = load_file(&self.path)?;
         let count = file.keys.len();
-        *self.inner.write().expect("keystore poisoned") = file;
-        tracing::info!(keys = count, "reloaded api keys");
+        let new_fp = fingerprint(&file);
+        let mut guard = self.inner.write().expect("keystore poisoned");
+        let changed = fingerprint(&guard) != new_fp;
+        *guard = file;
+        drop(guard);
+        if changed {
+            tracing::info!(keys = count, "reloaded api keys");
+        } else {
+            tracing::debug!(keys = count, "key file reload: no change");
+        }
         Ok(())
     }
 
@@ -443,6 +474,26 @@ mod tests {
         let file: KeyFile = serde_json::from_str(json).unwrap();
         assert_eq!(file.keys[0].role, Role::Render);
         assert!(!file.keys[0].disabled);
+    }
+
+    #[test]
+    fn fingerprint_detects_changes_only() {
+        let mut file = KeyFile::default();
+        let fp_empty = fingerprint(&file);
+        assert_eq!(fp_empty, fingerprint(&file), "identical content → identical fingerprint");
+        file.keys.push(KeyEntry {
+            id: "a".into(),
+            label: "l".into(),
+            hash: "deadbeef".into(),
+            role: Role::Render,
+            created_at: 1,
+            disabled: false,
+        });
+        let fp_one = fingerprint(&file);
+        assert_ne!(fp_empty, fp_one, "adding a key changes the fingerprint");
+        // Toggling a persisted field (disabled) changes the fingerprint.
+        file.keys[0].disabled = true;
+        assert_ne!(fp_one, fingerprint(&file), "disabling a key changes the fingerprint");
     }
 
     #[test]
