@@ -116,20 +116,18 @@ fn bootstrap_admin(keys: &Arc<KeyStore>, config: &Config) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Hot-reload the key store on SIGHUP and on file modification, so the CLI can
-/// add/revoke keys without restarting the server.
 /// Whether a notify event should trigger a key-store reload: it must touch the
 /// keys file itself (we watch the parent dir, so unrelated siblings churn too)
 /// and be a create/modify/remove — access/metadata-only noise is ignored.
 fn is_relevant_key_event(event: &notify::Event, keys_path: &std::path::Path) -> bool {
     let touches_keys_file = event.paths.iter().any(|p| p == keys_path);
-    let meaningful = matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    );
+    let meaningful =
+        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_));
     touches_keys_file && meaningful
 }
 
+/// Hot-reload the key store on SIGHUP and on file modification, so the CLI can
+/// add/revoke keys without restarting the server.
 fn spawn_key_reloaders(keys: Arc<KeyStore>) {
     // SIGHUP → reload.
     let sighup_keys = keys.clone();
