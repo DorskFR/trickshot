@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::target::{
+    CreateBrowserContextParams, CreateTargetParams,
+};
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
@@ -26,6 +29,9 @@ pub struct ShotRequest {
     /// Device pixel ratio (DPR). 1.0 = standard, 2.0 = crisp "retina" 2x render.
     pub scale: f64,
     pub timeout: Duration,
+    /// Optional per-context proxy (e.g. `socks5://127.0.0.1:NNNN`) routing this
+    /// shot's traffic through a reverse tunnel (TRI-5). `None` = direct egress.
+    pub proxy_server: Option<String>,
 }
 
 /// Startup configuration for the Chrome engine.
@@ -118,17 +124,43 @@ impl Chrome {
     }
 
     async fn render_inner(&self, url: &Url, req: &ShotRequest) -> Result<Vec<u8>, ApiError> {
-        let page = self
+        // Create an isolated browser context for this shot. When `proxy_server`
+        // is set (a reverse tunnel, TRI-5), Chrome forces all of this context's
+        // traffic — DNS included, since SOCKS5 resolves at the proxy — through
+        // it, without touching the warm browser's global config. The context is
+        // always disposed before returning, freeing its cookies/cache.
+        let mut ctx_params = CreateBrowserContextParams::builder();
+        if let Some(proxy) = &req.proxy_server {
+            ctx_params = ctx_params.proxy_server(proxy.clone());
+        }
+        let ctx_params = ctx_params.build();
+        let ctx_id = self
             .browser
-            .new_page("about:blank")
+            .create_browser_context(ctx_params)
             .await
-            .map_err(|e| ApiError::Render(format!("new page: {e}")))?;
+            .map_err(|e| ApiError::Render(format!("create browser context: {e}")))?;
 
-        // Render the page, capturing the result so we can always close the tab.
+        let target = CreateTargetParams::builder()
+            .url("about:blank")
+            .browser_context_id(ctx_id.clone())
+            .build()
+            .map_err(|e| ApiError::Internal(format!("create target params: {e}")))?;
+        let page = match self.browser.new_page(target).await {
+            Ok(page) => page,
+            Err(e) => {
+                let _ = self.browser.dispose_browser_context(ctx_id).await;
+                return Err(ApiError::Render(format!("new page: {e}")));
+            }
+        };
+
+        // Render the page, capturing the result so we can always tear down.
         let result = Self::shoot(&page, url, req).await;
 
         if let Err(err) = page.close().await {
             tracing::warn!(error = %err, "failed to close chrome page");
+        }
+        if let Err(err) = self.browser.dispose_browser_context(ctx_id).await {
+            tracing::warn!(error = %err, "failed to dispose browser context");
         }
         result
     }

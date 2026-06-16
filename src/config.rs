@@ -66,4 +66,23 @@ pub struct Config {
     /// (RFC1918, loopback, link-local incl. cloud metadata). Default deny.
     #[arg(long, env = "TRICKSHOT_ALLOW_PRIVATE_TARGETS", default_value_t = false)]
     pub allow_private_targets: bool,
+
+    /// Max concurrent reverse tunnels (`/tunnel`); further upgrades are
+    /// rejected. Each tunnel binds one loopback SOCKS5 listener.
+    #[arg(long, env = "TRICKSHOT_MAX_TUNNELS", default_value_t = 16)]
+    pub max_tunnels: usize,
+
+    /// Drop a reverse tunnel after this many seconds with no WebSocket traffic.
+    #[arg(long, env = "TRICKSHOT_TUNNEL_IDLE_SECS", default_value_t = 300)]
+    pub tunnel_idle_secs: u64,
+}
+
+impl Config {
+    /// Lifecycle limits for the reverse-tunnel subsystem.
+    pub const fn tunnel_config(&self) -> crate::tunnel::TunnelConfig {
+        crate::tunnel::TunnelConfig {
+            max_tunnels: self.max_tunnels,
+            idle_timeout: std::time::Duration::from_secs(self.tunnel_idle_secs),
+        }
+    }
 }

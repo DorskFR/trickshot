@@ -7,6 +7,7 @@ mod error;
 mod handlers;
 mod keys;
 mod ssrf;
+mod tunnel;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,12 +23,14 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::chrome::{Chrome, ChromeConfig};
 use crate::config::{Cli, Cmd, Config};
 use crate::keys::KeyStore;
+use crate::tunnel::TunnelRegistry;
 
 /// Shared application state handed to every handler.
 pub struct AppState {
     pub config: Config,
     pub chrome: Arc<Chrome>,
     pub keys: Arc<KeyStore>,
+    pub tunnels: Arc<TunnelRegistry>,
 }
 
 #[tokio::main]
@@ -64,7 +67,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let chrome = Chrome::start(&chrome_cfg).await?;
 
     let bind = config.bind.clone();
-    let state = Arc::new(AppState { config, chrome, keys });
+    let tunnels = TunnelRegistry::new();
+    let state = Arc::new(AppState { config, chrome, keys, tunnels });
 
     let app = build_router(state);
 
@@ -147,9 +151,10 @@ fn spawn_key_reloaders(keys: Arc<KeyStore>) {
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    let shot = Router::new()
+    let authed = Router::new()
         .route("/shot", get(handlers::shot))
-        // Auth guard on /shot only; /health stays open.
+        .route("/tunnel", get(handlers::tunnel))
+        // Auth guard on /shot and /tunnel; /health stays open.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             handlers::require_api_key,
@@ -157,7 +162,7 @@ fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(handlers::health))
-        .merge(shot)
+        .merge(authed)
         // Per-request access log; enable with `tower_http=debug` in RUST_LOG.
         .layer(TraceLayer::new_for_http())
         .with_state(state)
