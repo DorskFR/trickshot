@@ -1,4 +1,31 @@
-use clap::Parser;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+
+use crate::keys::KeysCmd;
+
+/// Top-level CLI: run the server (default) or manage API keys.
+#[derive(Debug, Parser)]
+#[command(name = "trickshot", about = "Fast screenshot-as-API backed by headless Chrome (CDP)")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub cmd: Option<Cmd>,
+
+    /// Server flags, used when no subcommand is given (the default `serve`).
+    #[command(flatten)]
+    pub serve: Config,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Cmd {
+    /// Run the HTTP server (default).
+    Serve(Config),
+    /// Manage API keys against `TRICKSHOT_KEYS_FILE`.
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
+}
 
 /// Runtime configuration, sourced from CLI flags or environment variables.
 #[derive(Debug, Clone, Parser)]
@@ -29,4 +56,14 @@ pub struct Config {
     /// many cheap tabs.
     #[arg(long, env = "TRICKSHOT_CHROME_MAX_CONCURRENCY", default_value_t = 4)]
     pub chrome_max_concurrency: usize,
+
+    /// File-backed API-key store (JSON). `/shot` requires a valid key; the
+    /// `trickshot keys …` CLI manages this same file.
+    #[arg(long, env = "TRICKSHOT_KEYS_FILE", default_value = "/data/keys.json")]
+    pub keys_file: PathBuf,
+
+    /// Allow rendering targets that resolve to private/reserved IP ranges
+    /// (RFC1918, loopback, link-local incl. cloud metadata). Default deny.
+    #[arg(long, env = "TRICKSHOT_ALLOW_PRIVATE_TARGETS", default_value_t = false)]
+    pub allow_private_targets: bool,
 }
