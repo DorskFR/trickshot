@@ -12,6 +12,9 @@ pub enum ApiError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("render timed out")]
     Timeout,
 
@@ -32,6 +35,7 @@ impl IntoResponse for ApiError {
         let status = match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Render(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

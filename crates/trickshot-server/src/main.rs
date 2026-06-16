@@ -22,7 +22,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::chrome::{Chrome, ChromeConfig};
 use crate::config::{Cli, Cmd, Config};
-use crate::keys::KeyStore;
+use crate::keys::{KeyStore, Role};
 use crate::tunnel::TunnelRegistry;
 
 /// Shared application state handed to every handler.
@@ -78,18 +78,41 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load the key store and start its hot-reload tasks.
+/// Load the key store, bootstrap the first admin key if needed, and start its
+/// hot-reload tasks.
 fn setup_keys(config: &Config) -> anyhow::Result<Arc<KeyStore>> {
     let keys = KeyStore::load(config.keys_file.clone())?;
+    bootstrap_admin(&keys, config)?;
     if !keys.has_enabled_keys() {
         tracing::warn!(
             path = %config.keys_file.display(),
-            "no enabled api keys — /shot will reject every request; \
-             run `trickshot keys create --label <name>`"
+            "no enabled api keys — /shot will reject every request"
         );
     }
     spawn_key_reloaders(keys.clone());
     Ok(keys)
+}
+
+/// Ensure at least one enabled `admin` key exists so remote `ts` management
+/// works with no `kubectl exec`. If `TRICKSHOT_BOOTSTRAP_ADMIN_KEY` is set, seed
+/// it; otherwise mint one and log a one-time secret. No-op once an admin key
+/// already exists.
+fn bootstrap_admin(keys: &Arc<KeyStore>, config: &Config) -> anyhow::Result<()> {
+    if keys.has_admin_key() {
+        return Ok(());
+    }
+    if let Some(secret) = &config.bootstrap_admin_key {
+        let info = keys.create_with_secret("bootstrap", Role::Admin, secret)?;
+        tracing::info!(key_id = %info.id, "seeded bootstrap admin key from TRICKSHOT_BOOTSTRAP_ADMIN_KEY");
+    } else {
+        let (info, secret) = keys.create("bootstrap", Role::Admin)?;
+        tracing::warn!(
+            key_id = %info.id,
+            "no admin key found and TRICKSHOT_BOOTSTRAP_ADMIN_KEY unset — minted a one-time \
+             bootstrap admin key. Save this secret now (shown once): {secret}"
+        );
+    }
+    Ok(())
 }
 
 /// Hot-reload the key store on SIGHUP and on file modification, so the CLI can
@@ -151,6 +174,8 @@ fn spawn_key_reloaders(keys: Arc<KeyStore>) {
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
+    use axum::routing::{delete, post};
+
     let authed = Router::new()
         .route("/shot", get(handlers::shot))
         .route("/tunnel", get(handlers::tunnel))
@@ -160,9 +185,23 @@ fn build_router(state: Arc<AppState>) -> Router {
             handlers::require_api_key,
         ));
 
+    // Admin key-management API: require_api_key (401) then require_admin (403).
+    let admin = Router::new()
+        .route("/admin/keys", post(handlers::admin_create_key).get(handlers::admin_list_keys))
+        .route("/admin/keys/{id}", delete(handlers::admin_delete_key))
+        .route("/admin/keys/{id}/disable", post(handlers::admin_disable_key))
+        .route("/admin/keys/{id}/enable", post(handlers::admin_enable_key))
+        .route("/admin/keys/{id}/role", post(handlers::admin_set_role))
+        .route_layer(axum::middleware::from_fn(handlers::require_admin))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            handlers::require_api_key,
+        ));
+
     Router::new()
         .route("/health", get(handlers::health))
         .merge(authed)
+        .merge(admin)
         // Per-request access log; enable with `tower_http=debug` in RUST_LOG.
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 
-use crate::Args;
+use crate::Shot;
 
 const OP_OPEN: u8 = 0x01;
 const OP_DATA: u8 = 0x02;
@@ -66,7 +66,7 @@ fn tunnel_url(server: &str) -> Result<Url> {
 }
 
 /// Open the tunnel, run the agent loop alongside the shot, then tear down.
-pub async fn run(args: &Args, parsed: &Url) -> Result<()> {
+pub async fn run(args: &Shot, parsed: &Url) -> Result<()> {
     let ws_url = tunnel_url(&args.server)?;
     let mut request =
         ws_url.as_str().into_client_request().context("building tunnel websocket request")?;
