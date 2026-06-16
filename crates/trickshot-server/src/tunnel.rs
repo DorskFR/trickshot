@@ -13,9 +13,11 @@
 //! Chrome resolves DNS at the proxy, so private hostnames resolve on the
 //! requester's side where they're valid. HTTP CONNECT would resolve locally.
 //!
-//! ## Wire protocol (binary WebSocket frames)
-//! One WS multiplexes many TCP streams via a 1-byte opcode + 4-byte big-endian
-//! stream id:
+//! ## Wire protocol
+//! On upgrade the server sends one **text** frame `{"tunnel_id":"…"}` so the
+//! agent learns the id to pass to `/shot?...&tunnel=<id>`. Everything after is
+//! **binary**: one WS multiplexes many TCP streams via a 1-byte opcode +
+//! 4-byte big-endian stream id:
 //!
 //! - `0x01` Open  — `[0x01][id:u32][host_len:u16][host][port:u16]` (server→agent)
 //! - `0x02` Data  — `[0x02][id:u32][bytes…]`                        (both ways)
@@ -185,6 +187,15 @@ pub async fn run(
     let tunnel = Arc::new(Tunnel { socks_addr, key_id: key_id.clone() });
     registry.insert(id.clone(), tunnel).await;
     tracing::info!(tunnel_id = %id, socks = %socks_addr, key_id = %key_id, "tunnel open");
+
+    // Hand the freshly minted id to the agent as the first frame: a single text
+    // message `{"tunnel_id":"…"}`. The agent reads it, then issues its shot with
+    // `&tunnel=<id>`. Every binary frame after this is the stream multiplex.
+    let hello = format!("{{\"tunnel_id\":\"{id}\"}}");
+    if socket.send(Message::Text(hello.into())).await.is_err() {
+        registry.remove(&id).await;
+        return;
+    }
 
     let conn = session(socket, listener, cfg.idle_timeout, &id).await;
 

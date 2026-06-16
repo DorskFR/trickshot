@@ -29,6 +29,46 @@ curl -H 'X-API-Key: <key>' \
   'http://localhost:8900/shot?url=https://example.com' -o shot.png
 ```
 
+## `ts` — CLI client
+
+`ts` is a small standalone binary (no Chrome dependency) that talks to a running
+trickshot server: it requests a screenshot and saves the PNG, and with
+`--tunnel` it doubles as the reverse-tunnel agent (see below) so a URL only
+reachable from *your* network can be screenshotted.
+
+Install: download the binary for your platform from the
+[Releases](https://github.com/dorskfr/trickshot/releases) page and put it on
+your `PATH`:
+
+```
+# pick the asset matching your OS/arch: ts-linux-amd64, ts-linux-arm64, ts-darwin-arm64
+curl -fsSL -o ts https://github.com/dorskfr/trickshot/releases/latest/download/ts-linux-amd64
+chmod +x ts && sudo mv ts /usr/local/bin/
+# verify against SHA256SUMS on the same release
+```
+
+Usage:
+
+```
+export TRICKSHOT_URL=https://shot.example.com
+export TRICKSHOT_API_KEY=<key>
+
+ts https://www.cryptact.io -w 1920 --height 1080 --dpr 2 -o shot.png
+ts https://internal.svc/dashboard --tunnel --height 1080 --dpr 2 -o shot.png
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<URL>` | — | page to screenshot (positional, required) |
+| `--server` / `TRICKSHOT_URL` | — | trickshot server base URL |
+| `--api-key` / `TRICKSHOT_API_KEY` | — | API key, sent as `X-API-Key` |
+| `-w`, `--width` | server default | viewport width in px |
+| `--height` | server default | viewport height in px (no `-h` short — that's `--help`) |
+| `--dpr` (alias `--scale`) | `1.0` | device pixel ratio; long-only (a `-dpr` short would parse as `-d -p -r`) |
+| `--timeout` | server default | render timeout in seconds |
+| `-o`, `--output` | `<host>.png` | output file, or `-` for stdout |
+| `--tunnel` | off | open a reverse tunnel for this shot |
+
 ## Authentication
 
 `/shot` requires an API key (`/health` stays open). Present it as a header
@@ -80,9 +120,10 @@ requester agent ──wss──> /tunnel ──> per-tunnel loopback SOCKS5 ─�
        └── dials the private URL on its own network <── tunneled TCP <─────┘
 ```
 
-1. The agent opens a WebSocket to `GET /tunnel` (authenticated with the same API
-   key as `/shot`). The server binds a per-tunnel SOCKS5 proxy on loopback and
-   returns a `tunnel_id`.
+1. The agent (`ts --tunnel`) opens a WebSocket to `GET /tunnel` (authenticated
+   with the same API key as `/shot`). The server binds a per-tunnel SOCKS5 proxy
+   on loopback and sends back the `tunnel_id` as the first WS frame (a text
+   message `{"tunnel_id":"…"}`).
 2. `GET /shot?url=https://internal.svc/&tunnel=<id>` renders that URL through a
    Chrome browser context whose `proxyServer` is the tunnel's loopback SOCKS5
    listener. Chrome resolves DNS *at the proxy*, so the private hostname is
@@ -96,10 +137,10 @@ listener binds loopback only, so it is never externally reachable. Because
 reachability is delegated to the requester's own network, the SSRF private-IP
 block is intentionally **skipped** for tunneled shots.
 
-The wire protocol (one WS multiplexing TCP streams via a `[op][stream_id]`
-framing) is documented at the top of `src/tunnel.rs`. The requester-side agent
-that dials targets and pipes bytes back is a **separate client** (tracked
-separately); this server ships the `/tunnel` endpoint, proxy, and lifecycle.
+The wire protocol (a text hello with the `tunnel_id`, then one WS multiplexing
+TCP streams via a `[op][stream_id]` binary framing) is documented at the top of
+`crates/trickshot-server/src/tunnel.rs`. The requester-side agent that dials
+targets and pipes bytes back ships in the `ts` CLI (`ts --tunnel`, see above).
 
 ## Develop
 
