@@ -87,7 +87,8 @@ as the `yt` CLI: `{"default":"…","servers":{"…":{"url","key"}}}`.
 
 `/shot` requires an API key (`/health` stays open). Present it as a header
 (`X-API-Key: <key>` or `Authorization: Bearer <key>`) or as a query param
-(`?api_key=<key>`, composes with the existing `GET /shot?url=…`). A missing or
+(`?api_key=<key>` or `?apiKey=<key>`, composes with the existing
+`GET /shot?url=…`). A missing or
 invalid key returns `401` with a JSON body. Keys are stored as SHA-256 hashes
 only, never plaintext; the matched key id/label/role is logged per request for
 attribution.
