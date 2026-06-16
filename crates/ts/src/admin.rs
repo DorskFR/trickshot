@@ -43,7 +43,7 @@ pub async fn run(server: Option<&str>, cmd: &KeysCmd) -> Result<()> {
                 v["label"].as_str().unwrap_or("?"),
                 v["role"].as_str().unwrap_or("?"),
             );
-            println!("Secret (shown once, store it now):\n{}", v["secret"].as_str().unwrap_or("?"),);
+            println!("Secret (shown once, store it now):\n{}", v["secret"].as_str().unwrap_or("?"));
         }
         KeysCmd::List => {
             let v =
