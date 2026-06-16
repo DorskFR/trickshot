@@ -3,8 +3,7 @@
 //! plaintext secret is shown exactly once, at creation.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;

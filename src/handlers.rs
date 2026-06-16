@@ -8,10 +8,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use url::Url;
 
-use crate::AppState;
 use crate::chrome::ShotRequest;
 use crate::error::ApiError;
-use crate::ssrf;
+use crate::{AppState, ssrf};
 
 pub async fn health() -> &'static str {
     "ok"
