@@ -7,7 +7,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::engine::ShotRequest;
+use crate::chrome::ShotRequest;
 use crate::error::ApiError;
 
 pub async fn health() -> &'static str {
@@ -43,39 +43,11 @@ pub async fn shot(
     };
 
     let started = Instant::now();
-    let png = state.pool.render(&req).await?;
-    tracing::info!(
-        url = %req.url,
-        bytes = png.len(),
-        ms = started.elapsed().as_millis(),
-        "rendered"
-    );
-
-    Ok(([(header::CONTENT_TYPE, "image/png")], png))
-}
-
-/// `GET /shot2?url=…&w=…&h=…&timeout=…` → `image/png`, rendered by the
-/// always-warm headless Chrome over CDP. Same contract as `/shot`.
-pub async fn shot2(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ShotParams>,
-) -> Result<impl IntoResponse, ApiError> {
-    let cfg = &state.config;
-    let req = ShotRequest {
-        url: params.url,
-        width: params.width.unwrap_or(cfg.default_width),
-        height: params.height.unwrap_or(cfg.default_height),
-        scale: params.scale.unwrap_or(1.0),
-        timeout: Duration::from_secs(params.timeout.unwrap_or(cfg.render_timeout_secs)),
-    };
-
-    let started = Instant::now();
     let png = state.chrome.render(&req).await?;
     tracing::info!(
         url = %req.url,
         bytes = png.len(),
         ms = started.elapsed().as_millis(),
-        engine = "chrome",
         "rendered"
     );
 

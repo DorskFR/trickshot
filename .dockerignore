@@ -1,6 +1,5 @@
 target/
 **/target/
-vendor/
 .git/
 .github/
 .claude/

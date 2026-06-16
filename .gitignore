@@ -1,5 +1,4 @@
 /target
-/vendor
 *.png
 *.log
 .env

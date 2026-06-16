@@ -1,9 +1,9 @@
 //! Chrome/CDP screenshot engine — a single always-warm headless Chrome driven
-//! over the DevTools Protocol. Unlike the Servo pool (one engine per worker),
-//! one Chrome process multiplexes many requests via cheap, isolated pages
-//! (tabs); concurrency is bounded by a semaphore rather than a worker count.
+//! over the DevTools Protocol. One Chrome process multiplexes many requests via
+//! cheap, isolated pages (tabs); concurrency is bounded by a semaphore.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
@@ -15,8 +15,18 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use url::Url;
 
-use crate::engine::ShotRequest;
 use crate::error::ApiError;
+
+/// A single render request, already resolved against config defaults.
+#[derive(Debug, Clone)]
+pub struct ShotRequest {
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+    /// Device pixel ratio (DPR). 1.0 = standard, 2.0 = crisp "retina" 2x render.
+    pub scale: f64,
+    pub timeout: Duration,
+}
 
 /// Startup configuration for the Chrome engine.
 #[derive(Debug, Clone)]
