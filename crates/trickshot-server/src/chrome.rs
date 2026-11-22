@@ -119,8 +119,7 @@ impl Chrome {
             .await
             .map_err(|_| ApiError::Internal("chrome engine closed".into()))?;
 
-        (timeout(req.timeout, self.render_inner(&url, req)).await)
-            .map_or(Err(ApiError::Timeout), |result| result)
+        (timeout(req.timeout, self.render_inner(&url, req)).await).unwrap_or(Err(ApiError::Timeout))
     }
 
     async fn render_inner(&self, url: &Url, req: &ShotRequest) -> Result<Vec<u8>, ApiError> {
