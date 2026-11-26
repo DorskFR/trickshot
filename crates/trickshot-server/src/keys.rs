@@ -3,7 +3,8 @@
 //! plaintext secret is shown exactly once, at creation.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -150,33 +151,77 @@ pub fn load_file(path: &Path) -> Result<KeyFile, ApiError> {
     }
 }
 
-/// Atomically write the key file (write-temp-then-rename).
+/// Atomically replace the key file: unique temp file in the same directory,
+/// fsync, rename, fsync the directory.
 pub fn save_file(path: &Path, file: &KeyFile) -> Result<(), ApiError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ApiError::Internal(format!("create keys dir: {e}")))?;
-    }
+    use std::io::Write;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let dir = parent_dir(path);
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ApiError::Internal(format!("create keys dir: {e}")))?;
     let json = serde_json::to_vec_pretty(file)
         .map_err(|e| ApiError::Internal(format!("serialize keys: {e}")))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).map_err(|e| ApiError::Internal(format!("write keys tmp: {e}")))?;
-    std::fs::rename(&tmp, path).map_err(|e| ApiError::Internal(format!("rename keys: {e}")))?;
-    Ok(())
+    let name = path.file_name().map_or_else(|| "keys".into(), |n| n.to_string_lossy());
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create_new(&tmp)?;
+        f.write_all(&json)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        ApiError::Internal(format!("write keys file: {e}"))
+    })
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))
+}
+
+/// Read-modify-write the key file under an exclusive advisory lock on a
+/// sidecar `.lock` file, so concurrent writers (server handlers and the CLI)
+/// never lose each other's updates.
+pub fn update_file<R>(
+    path: &Path,
+    f: impl FnOnce(&mut KeyFile) -> Result<R, ApiError>,
+) -> Result<(KeyFile, R), ApiError> {
+    let dir = parent_dir(path);
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ApiError::Internal(format!("create keys dir: {e}")))?;
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| ApiError::Internal(format!("open keys lock: {e}")))?;
+    lock.lock().map_err(|e| ApiError::Internal(format!("lock keys file: {e}")))?;
+    let mut file = load_file(path)?;
+    let out = f(&mut file)?;
+    save_file(path, &file)?;
+    Ok((file, out))
 }
 
 /// In-memory, hot-reloadable view of the key store used by the request path.
 pub struct KeyStore {
     path: PathBuf,
     inner: RwLock<KeyFile>,
+    writer: Mutex<()>,
 }
 
 impl KeyStore {
     /// Load the store from `path`. A missing file is treated as empty.
     pub fn load(path: PathBuf) -> Result<Arc<Self>, ApiError> {
         let file = load_file(&path)?;
-        Ok(Arc::new(Self { path, inner: RwLock::new(file) }))
+        Ok(Arc::new(Self { path, inner: RwLock::new(file), writer: Mutex::new(()) }))
     }
 
     /// Re-read the file from disk, replacing the in-memory view. Used on file
@@ -235,46 +280,50 @@ impl KeyStore {
             .any(|k| !k.disabled && k.role == Role::Admin)
     }
 
-    /// Persist the current in-memory view back to disk, then reload it (the
-    /// file watcher also catches the write, but reloading inline keeps the
-    /// in-memory view authoritative for the just-applied mutation).
-    fn persist(&self, file: &KeyFile) -> Result<(), ApiError> {
-        save_file(&self.path, file)?;
-        *self.inner.write().expect("keystore poisoned") = file.clone();
-        Ok(())
+    /// Whether `id` names an enabled key.
+    pub fn is_enabled(&self, id: &str) -> bool {
+        self.inner.read().expect("keystore poisoned").keys.iter().any(|k| k.id == id && !k.disabled)
+    }
+
+    /// Apply `f` to the on-disk file under the store's write lock, then make
+    /// the result the in-memory view.
+    fn update<R>(
+        &self,
+        f: impl FnOnce(&mut KeyFile) -> Result<R, ApiError>,
+    ) -> Result<R, ApiError> {
+        let _writer = self.writer.lock().expect("keystore writer poisoned");
+        let (file, out) = update_file(&self.path, f)?;
+        *self.inner.write().expect("keystore poisoned") = file;
+        Ok(out)
     }
 
     /// Create a new key with `label`/`role`, persist its hash, return the
     /// entry's public info plus the one-time plaintext secret.
     pub fn create(&self, label: &str, role: Role) -> Result<(KeyInfo, String), ApiError> {
         let (id, secret) = gen_key();
-        let mut file = self.inner.read().expect("keystore poisoned").clone();
-        let entry = KeyEntry {
-            id,
-            label: label.to_string(),
-            hash: hash_key(&secret),
-            role,
-            created_at: now_secs(),
-            disabled: false,
-        };
-        file.keys.push(entry.clone());
-        self.persist(&file)?;
-        Ok(((&entry).into(), secret))
+        let info = self.insert(id, label, role, &secret)?;
+        Ok((info, secret))
     }
 
-    /// Seed a bootstrap admin key from a known plaintext secret. Used at
-    /// startup so the operator can inject `TRICKSHOT_BOOTSTRAP_ADMIN_KEY` once.
+    /// Seed a bootstrap admin key from a known plaintext secret.
     pub fn create_with_secret(
         &self,
         label: &str,
         role: Role,
         secret: &str,
     ) -> Result<KeyInfo, ApiError> {
-        let mut rng = rand::rng();
         let mut id_buf = [0u8; 6];
-        rng.fill_bytes(&mut id_buf);
-        let id = URL_SAFE_NO_PAD.encode(id_buf);
-        let mut file = self.inner.read().expect("keystore poisoned").clone();
+        rand::rng().fill_bytes(&mut id_buf);
+        self.insert(URL_SAFE_NO_PAD.encode(id_buf), label, role, secret)
+    }
+
+    fn insert(
+        &self,
+        id: String,
+        label: &str,
+        role: Role,
+        secret: &str,
+    ) -> Result<KeyInfo, ApiError> {
         let entry = KeyEntry {
             id,
             label: label.to_string(),
@@ -283,9 +332,12 @@ impl KeyStore {
             created_at: now_secs(),
             disabled: false,
         };
-        file.keys.push(entry.clone());
-        self.persist(&file)?;
-        Ok((&entry).into())
+        let info = KeyInfo::from(&entry);
+        self.update(|file| {
+            file.keys.push(entry);
+            Ok(())
+        })?;
+        Ok(info)
     }
 
     /// List all keys' public info (never secrets/hashes).
@@ -297,16 +349,15 @@ impl KeyStore {
     where
         F: FnOnce(&mut KeyEntry),
     {
-        let mut file = self.inner.read().expect("keystore poisoned").clone();
-        let entry = file
-            .keys
-            .iter_mut()
-            .find(|k| k.id == id)
-            .ok_or_else(|| ApiError::BadRequest(format!("no key with id {id}")))?;
-        f(entry);
-        let info = KeyInfo::from(&*entry);
-        self.persist(&file)?;
-        Ok(info)
+        self.update(|file| {
+            let entry = file
+                .keys
+                .iter_mut()
+                .find(|k| k.id == id)
+                .ok_or_else(|| ApiError::BadRequest(format!("no key with id {id}")))?;
+            f(entry);
+            Ok(KeyInfo::from(&*entry))
+        })
     }
 
     pub fn set_disabled(&self, id: &str, disabled: bool) -> Result<KeyInfo, ApiError> {
@@ -318,14 +369,17 @@ impl KeyStore {
     }
 
     pub fn delete(&self, id: &str) -> Result<(), ApiError> {
-        let mut file = self.inner.read().expect("keystore poisoned").clone();
-        let before = file.keys.len();
-        file.keys.retain(|k| k.id != id);
-        if file.keys.len() == before {
-            return Err(ApiError::BadRequest(format!("no key with id {id}")));
-        }
-        self.persist(&file)
+        self.update(|file| remove_entry(file, id))
     }
+}
+
+fn remove_entry(file: &mut KeyFile, id: &str) -> Result<(), ApiError> {
+    let before = file.keys.len();
+    file.keys.retain(|k| k.id != id);
+    if file.keys.len() == before {
+        return Err(ApiError::BadRequest(format!("no key with id {id}")));
+    }
+    Ok(())
 }
 
 // --- CLI ---------------------------------------------------------------------
@@ -354,23 +408,25 @@ pub enum KeysCmd {
 
 /// Execute a `trickshot keys …` subcommand against `keys_file`.
 pub fn run(cmd: &KeysCmd, keys_file: &Path) -> Result<(), ApiError> {
-    let mut file = load_file(keys_file)?;
     match cmd {
         KeysCmd::Create { label, role } => {
             let (id, secret) = gen_key();
-            file.keys.push(KeyEntry {
-                id: id.clone(),
-                label: label.clone(),
-                hash: hash_key(&secret),
-                role: *role,
-                created_at: now_secs(),
-                disabled: false,
-            });
-            save_file(keys_file, &file)?;
+            update_file(keys_file, |file| {
+                file.keys.push(KeyEntry {
+                    id: id.clone(),
+                    label: label.clone(),
+                    hash: hash_key(&secret),
+                    role: *role,
+                    created_at: now_secs(),
+                    disabled: false,
+                });
+                Ok(())
+            })?;
             println!("Created key id={id} label={label} role={role}");
             println!("Secret (shown once, store it now):\n{secret}");
         }
         KeysCmd::List => {
+            let file = load_file(keys_file)?;
             if file.keys.is_empty() {
                 println!("(no keys)");
             }
@@ -385,29 +441,26 @@ pub fn run(cmd: &KeysCmd, keys_file: &Path) -> Result<(), ApiError> {
                 );
             }
         }
-        KeysCmd::Disable { id } => set_disabled(&mut file, keys_file, id, true)?,
-        KeysCmd::Enable { id } => set_disabled(&mut file, keys_file, id, false)?,
+        KeysCmd::Disable { id } => set_disabled(keys_file, id, true)?,
+        KeysCmd::Enable { id } => set_disabled(keys_file, id, false)?,
         KeysCmd::Delete { id } => {
-            let before = file.keys.len();
-            file.keys.retain(|k| &k.id != id);
-            if file.keys.len() == before {
-                return Err(ApiError::BadRequest(format!("no key with id {id}")));
-            }
-            save_file(keys_file, &file)?;
+            update_file(keys_file, |file| remove_entry(file, id))?;
             println!("Deleted key id={id}");
         }
     }
     Ok(())
 }
 
-fn set_disabled(file: &mut KeyFile, path: &Path, id: &str, disabled: bool) -> Result<(), ApiError> {
-    let entry = file
-        .keys
-        .iter_mut()
-        .find(|k| k.id == id)
-        .ok_or_else(|| ApiError::BadRequest(format!("no key with id {id}")))?;
-    entry.disabled = disabled;
-    save_file(path, file)?;
+fn set_disabled(path: &Path, id: &str, disabled: bool) -> Result<(), ApiError> {
+    update_file(path, |file| {
+        let entry = file
+            .keys
+            .iter_mut()
+            .find(|k| k.id == id)
+            .ok_or_else(|| ApiError::BadRequest(format!("no key with id {id}")))?;
+        entry.disabled = disabled;
+        Ok(())
+    })?;
     println!("{} key id={id}", if disabled { "Disabled" } else { "Enabled" });
     Ok(())
 }
@@ -422,6 +475,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("trickshot-keys-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         KeyStore::load(dir.join("keys.json")).unwrap()
+    }
+
+    #[test]
+    fn concurrent_mutations_lose_nothing() {
+        let s = store();
+        let (victim, _) = s.create("leaked", Role::Render).unwrap();
+        let other = KeyStore::load(s.path().to_path_buf()).unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let s = if i % 2 == 0 { &s } else { &other };
+                scope.spawn(move || s.create(&format!("k{i}"), Role::Render).unwrap());
+            }
+            scope.spawn(|| s.set_disabled(&victim.id, true).unwrap());
+        });
+        let on_disk = load_file(s.path()).unwrap();
+        assert_eq!(on_disk.keys.len(), 17);
+        assert!(on_disk.keys.iter().find(|k| k.id == victim.id).unwrap().disabled);
+        let dir = s.path().parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn mutation_rereads_file_changed_by_another_writer() {
+        let s = store();
+        let (a, _) = s.create("a", Role::Render).unwrap();
+        run(&KeysCmd::Disable { id: a.id.clone() }, s.path()).unwrap();
+        s.create("b", Role::Render).unwrap();
+        assert!(!s.is_enabled(&a.id));
+        assert!(load_file(s.path()).unwrap().keys.iter().find(|k| k.id == a.id).unwrap().disabled);
     }
 
     #[test]
