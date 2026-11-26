@@ -9,7 +9,7 @@ just navigate + screenshot with no per-request browser startup.
 
 | Route | Description |
 |-------|-------------|
-| `GET /health` | liveness, returns `ok` |
+| `GET /health` | liveness: `ok`, or `503` once Chrome stops answering over CDP |
 | `GET /shot?url=<URL>` | render `URL` via headless Chrome (CDP), returns `image/png` |
 | `GET /tunnel` | WebSocket upgrade; opens a reverse tunnel for private/VPN URLs (auth required) |
 | `POST/GET /admin/keys`, `…/{id}/disable\|enable\|role`, `DELETE …/{id}` | remote key management (admin key required) |
@@ -195,6 +195,12 @@ freed. Concurrent tunnels are capped by `TRICKSHOT_MAX_TUNNELS`. The SOCKS
 listener binds loopback only, so it is never externally reachable. Because
 reachability is delegated to the requester's own network, the SSRF private-IP
 block is intentionally **skipped** for tunneled shots.
+
+A tunnel belongs to the key that opened it: `/shot?tunnel=<id>` with any other
+key gets `404`, the same as an unknown id. Disabling or deleting that key (via
+the admin API or `trickshot keys`) closes its tunnels. The id is a bearer
+capability, so the server logs only a short hash of it and `ts` does not print
+it.
 
 The wire protocol (a text hello with the `tunnel_id`, then one WS multiplexing
 TCP streams via a `[op][stream_id]` binary framing) is documented at the top of

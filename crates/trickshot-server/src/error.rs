@@ -15,6 +15,9 @@ pub enum ApiError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("render timed out")]
     Timeout,
 
@@ -36,6 +39,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Render(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

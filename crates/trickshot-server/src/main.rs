@@ -61,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(bind = %config.bind, "starting trickshot");
 
-    let keys = setup_keys(&config)?;
+    let tunnels = TunnelRegistry::new();
+    let keys = setup_keys(&config, &tunnels)?;
 
     let egress = EgressGuard::start(egress::policy(config.allow_private_targets)).await?;
     let chrome_cfg = ChromeConfig {
@@ -75,7 +76,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let chrome = Chrome::start(&chrome_cfg).await?;
 
     let bind = config.bind.clone();
-    let tunnels = TunnelRegistry::new();
     let state = Arc::new(AppState { config, chrome, keys, tunnels, _egress: egress });
 
     let app = build_router(state);
@@ -88,7 +88,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
 /// Load the key store, bootstrap the first admin key if needed, and start its
 /// hot-reload tasks.
-fn setup_keys(config: &Config) -> anyhow::Result<Arc<KeyStore>> {
+fn setup_keys(config: &Config, tunnels: &Arc<TunnelRegistry>) -> anyhow::Result<Arc<KeyStore>> {
     let keys = KeyStore::load(config.keys_file.clone())?;
     bootstrap_admin(&keys, config)?;
     if !keys.has_enabled_keys() {
@@ -97,7 +97,7 @@ fn setup_keys(config: &Config) -> anyhow::Result<Arc<KeyStore>> {
             "no enabled api keys — /shot will reject every request"
         );
     }
-    spawn_key_reloaders(keys.clone());
+    spawn_key_reloaders(keys.clone(), tunnels.clone());
     Ok(keys)
 }
 
@@ -133,11 +133,20 @@ fn is_relevant_key_event(event: &notify::Event, keys_path: &std::path::Path) -> 
     touches_keys_file && meaningful
 }
 
+/// Reload the key store, then close tunnels whose key was revoked.
+async fn reload_keys(keys: &KeyStore, tunnels: &TunnelRegistry, source: &str) {
+    match keys.reload() {
+        Ok(()) => tunnels.retain_owners(|k| keys.is_enabled(k)).await,
+        Err(e) => tracing::warn!(error = %e, source, "key reload failed"),
+    }
+}
+
 /// Hot-reload the key store on SIGHUP and on file modification, so the CLI can
 /// add/revoke keys without restarting the server.
-fn spawn_key_reloaders(keys: Arc<KeyStore>) {
+fn spawn_key_reloaders(keys: Arc<KeyStore>, tunnels: Arc<TunnelRegistry>) {
     // SIGHUP → reload.
     let sighup_keys = keys.clone();
+    let sighup_tunnels = tunnels.clone();
     tokio::spawn(async move {
         let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(s) => s,
@@ -147,9 +156,7 @@ fn spawn_key_reloaders(keys: Arc<KeyStore>) {
             }
         };
         while sig.recv().await.is_some() {
-            if let Err(e) = sighup_keys.reload() {
-                tracing::warn!(error = %e, "key reload (SIGHUP) failed");
-            }
+            reload_keys(&sighup_keys, &sighup_tunnels, "sighup").await;
         }
     });
 
@@ -186,9 +193,7 @@ fn spawn_key_reloaders(keys: Arc<KeyStore>) {
                     // Debounce a burst of fs events.
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     while rx.try_recv().is_ok() {}
-                    if let Err(e) = keys.reload() {
-                        tracing::warn!(error = %e, "key reload (watch) failed");
-                    }
+                    reload_keys(&keys, &tunnels, "watch").await;
                 }
             });
         }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Json, Path, Query, Request, State};
-use axum::http::{HeaderMap, header};
+use axum::extract::{Extension, Json, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,18 @@ use crate::error::ApiError;
 use crate::keys::{KeyInfo, Role};
 use crate::{AppState, ssrf, tunnel};
 
-pub async fn health() -> &'static str {
-    "ok"
+/// Liveness: fails once the CDP connection to Chrome is gone, so the pod is
+/// restarted instead of serving errors forever.
+pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, &'static str) {
+    health_status(state.chrome.is_alive().await)
+}
+
+const fn health_status(chrome_alive: bool) -> (StatusCode, &'static str) {
+    if chrome_alive {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "chrome connection lost")
+    }
 }
 
 /// Extract the presented API key from (in order) `X-API-Key`,
@@ -100,6 +110,7 @@ pub struct ShotParams {
 /// `GET /shot?url=…&w=…&h=…&timeout=…` → `image/png`.
 pub async fn shot(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<AuthedKey>,
     Query(params): Query<ShotParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let cfg = &state.config;
@@ -113,11 +124,8 @@ pub async fn shot(
         Url::parse(&params.url).map_err(|e| ApiError::BadRequest(format!("invalid url: {e}")))?;
 
     let proxy_server = if let Some(id) = &params.tunnel {
-        let t = state
-            .tunnels
-            .get(id)
-            .await
-            .ok_or_else(|| ApiError::BadRequest("unknown or closed tunnel".into()))?;
+        let t = state.tunnels.get(id).await.filter(|t| t.key_id == caller.id);
+        let t = t.ok_or_else(|| ApiError::NotFound("unknown or closed tunnel".into()))?;
         Some(t.proxy_server())
     } else {
         ssrf::check(&parsed, cfg.allow_private_targets).await?;
@@ -127,7 +135,7 @@ pub async fn shot(
     let req = ShotRequest { url: params.url, width, height, scale, timeout, proxy_server };
 
     let started = Instant::now();
-    let png = state.chrome.render(&req).await?;
+    let png = state.chrome.render(req.clone()).await?;
     tracing::info!(
         url = %req.url,
         bytes = png.len(),
@@ -231,12 +239,18 @@ pub async fn admin_list_keys(
     Ok(Json(state.keys.list()))
 }
 
-/// `POST /admin/keys/{id}/disable`.
+/// `POST /admin/keys/{id}/disable`. Also closes the key's open tunnels.
 pub async fn admin_disable_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(state.keys.set_disabled(&id, true)?))
+    let info = state.keys.set_disabled(&id, true)?;
+    close_revoked_tunnels(&state).await;
+    Ok(Json(info))
+}
+
+pub async fn close_revoked_tunnels(state: &AppState) {
+    state.tunnels.retain_owners(|key_id| state.keys.is_enabled(key_id)).await;
 }
 
 /// `POST /admin/keys/{id}/enable`.
@@ -253,6 +267,7 @@ pub async fn admin_delete_key(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.keys.delete(&id)?;
+    close_revoked_tunnels(&state).await;
     Ok(Json(serde_json::json!({"deleted": id})))
 }
 
@@ -313,9 +328,14 @@ mod tests {
 
     #[test]
     fn out_of_range_is_400() {
-        use axum::http::StatusCode;
         let err = dimension("width", Some(100_000), 1024).unwrap_err();
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn health_fails_when_chrome_is_gone() {
+        assert_eq!(health_status(true).0, StatusCode::OK);
+        assert_eq!(health_status(false).0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
