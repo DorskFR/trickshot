@@ -9,7 +9,7 @@ just navigate + screenshot with no per-request browser startup.
 
 | Route | Description |
 |-------|-------------|
-| `GET /health` | liveness, returns `ok` |
+| `GET /health` | liveness: `ok`, or `503` once Chrome stops answering over CDP |
 | `GET /shot?url=<URL>` | render `URL` via headless Chrome (CDP), returns `image/png` |
 | `GET /tunnel` | WebSocket upgrade; opens a reverse tunnel for private/VPN URLs (auth required) |
 | `POST/GET /admin/keys`, `…/{id}/disable\|enable\|role`, `DELETE …/{id}` | remote key management (admin key required) |
@@ -19,11 +19,13 @@ Query params:
 | Param | Aliases | Required | Default | Description |
 |-------|---------|----------|---------|-------------|
 | `url` | — | yes | — | page to render |
-| `width` | `w` | no | `TRICKSHOT_DEFAULT_WIDTH` | viewport width in px |
-| `height` | `h` | no | `TRICKSHOT_DEFAULT_HEIGHT` | viewport height in px |
-| `scale` | `dpr` | no | `1.0` | device pixel ratio; `2` = crisp 2x retina render |
-| `timeout` | — | no | `TRICKSHOT_RENDER_TIMEOUT_SECS` | render timeout in seconds |
+| `width` | `w` | no | `TRICKSHOT_DEFAULT_WIDTH` | viewport width in px, `1..=4096` |
+| `height` | `h` | no | `TRICKSHOT_DEFAULT_HEIGHT` | viewport height in px, `1..=4096` |
+| `scale` | `dpr` | no | `1.0` | device pixel ratio, `0.5..=3`; `2` = crisp 2x retina render |
+| `timeout` | — | no | `TRICKSHOT_RENDER_TIMEOUT_SECS` | render timeout in seconds, at most `TRICKSHOT_RENDER_TIMEOUT_SECS` |
 | `tunnel` | — | no | — | id of an open reverse tunnel to route this shot through (see below) |
+
+Out-of-range values are rejected with `400`.
 
 ```
 curl -H 'X-API-Key: <key>' \
@@ -138,15 +140,32 @@ Each maps to an `/admin/keys…` call authenticated with the admin key. Using a
 
 ## SSRF protection
 
-Defense in depth on top of auth: after the target URL is parsed its host is
-resolved and any **private/reserved** IP is rejected — RFC1918 (`10/8`,
+Defense in depth on top of auth. Blocked ranges: RFC1918 (`10/8`,
 `172.16/12`, `192.168/16`), loopback (`127/8`, `::1`), link-local
-(`169.254/16` incl. cloud metadata `169.254.169.254`, `fe80::/10`), `0.0.0.0`,
-ULA `fc00::/7`, and CGNAT `100.64/10`. Set
-`TRICKSHOT_ALLOW_PRIVATE_TARGETS=true` to permit them (default deny). The check
-is on the resolved IP, not just the literal host; a resolve-then-connect
-TOCTOU/DNS-rebinding gap remains and full connect-time pinning is out of scope
-for v1.
+(`169.254/16` incl. cloud metadata, `fe80::/10`), `0/8`, CGNAT `100.64/10`,
+`192.0.0/24`, `198.18/15`, multicast, `240/4`, ULA `fc00::/7`, and IPv6 forms
+embedding a blocked v4 (mapped, NAT64, 6to4).
+
+- The submitted URL is resolved up front and rejected with `400` if any address
+  is blocked.
+- Every connection Chrome makes (redirect hops, iframes, subresources, fetch,
+  workers, WebSockets) goes through an in-process loopback SOCKS5 **egress
+  guard**. It resolves the hostname itself, refuses the connection if any
+  address is blocked, and dials the exact address it checked, so DNS rebinding
+  has no second lookup to win. Chrome's implicit loopback proxy bypass is
+  disabled and WebRTC is limited to proxied traffic.
+
+Set `TRICKSHOT_ALLOW_PRIVATE_TARGETS=true` to permit private targets (default
+deny).
+
+## Chromium sandbox
+
+Chromium runs as a non-root user (uid `65532`) with its sandbox **on**. The
+sandbox needs unprivileged user namespaces; container runtimes' default seccomp
+profile blocks them, so the pod runs with `seccompProfile: Unconfined` (the
+renderers then get Chromium's own seccomp-bpf filter plus user, pid and network
+namespaces). `TRICKSHOT_CHROME_NO_SANDBOX=true` turns the sandbox off for hosts
+where user namespaces are unavailable; avoid it in production.
 
 ## Reverse tunnels (private/VPN URLs)
 
@@ -176,6 +195,12 @@ freed. Concurrent tunnels are capped by `TRICKSHOT_MAX_TUNNELS`. The SOCKS
 listener binds loopback only, so it is never externally reachable. Because
 reachability is delegated to the requester's own network, the SSRF private-IP
 block is intentionally **skipped** for tunneled shots.
+
+A tunnel belongs to the key that opened it: `/shot?tunnel=<id>` with any other
+key gets `404`, the same as an unknown id. Disabling or deleting that key (via
+the admin API or `trickshot keys`) closes its tunnels. The id is a bearer
+capability, so the server logs only a short hash of it and `ts` does not print
+it.
 
 The wire protocol (a text hello with the `tunnel_id`, then one WS multiplexing
 TCP streams via a `[op][stream_id]` binary framing) is documented at the top of

@@ -1,9 +1,10 @@
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Json, Path, Query, Request, State};
-use axum::http::{HeaderMap, header};
+use axum::extract::{Extension, Json, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -14,8 +15,18 @@ use crate::error::ApiError;
 use crate::keys::{KeyInfo, Role};
 use crate::{AppState, ssrf, tunnel};
 
-pub async fn health() -> &'static str {
-    "ok"
+/// Liveness: fails once the CDP connection to Chrome is gone, so the pod is
+/// restarted instead of serving errors forever.
+pub async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, &'static str) {
+    health_status(state.chrome.is_alive().await)
+}
+
+const fn health_status(chrome_alive: bool) -> (StatusCode, &'static str) {
+    if chrome_alive {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "chrome connection lost")
+    }
 }
 
 /// Extract the presented API key from (in order) `X-API-Key`,
@@ -91,49 +102,40 @@ pub struct ShotParams {
     #[serde(alias = "dpr")]
     pub scale: Option<f64>,
     pub timeout: Option<u64>,
-    /// Route this shot through an open reverse tunnel (TRI-5). When set, the
-    /// shot uses the tunnel's loopback SOCKS5 proxy and the direct-path SSRF
-    /// private-IP block is skipped (reachability is the requester's network's).
+    /// Route this shot through an open reverse tunnel. The private-IP block is
+    /// skipped: reachability is the requester's network's.
     pub tunnel: Option<String>,
 }
 
 /// `GET /shot?url=…&w=…&h=…&timeout=…` → `image/png`.
 pub async fn shot(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<AuthedKey>,
     Query(params): Query<ShotParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let cfg = &state.config;
 
+    let width = dimension("width", params.width, cfg.default_width)?;
+    let height = dimension("height", params.height, cfg.default_height)?;
+    let scale = scale(params.scale)?;
+    let timeout = timeout(params.timeout, cfg.render_timeout_secs)?;
+
     let parsed =
         Url::parse(&params.url).map_err(|e| ApiError::BadRequest(format!("invalid url: {e}")))?;
 
-    // Resolve an optional reverse tunnel. When present, traffic is delegated to
-    // the requester's network: we use its loopback SOCKS5 proxy and skip the
-    // direct-path SSRF private-IP block (intentional, per TRI-5). Without a
-    // tunnel, behaviour is unchanged — direct egress + the SSRF block.
     let proxy_server = if let Some(id) = &params.tunnel {
-        let t = state
-            .tunnels
-            .get(id)
-            .await
-            .ok_or_else(|| ApiError::BadRequest("unknown or closed tunnel".into()))?;
+        let t = state.tunnels.get(id).await.filter(|t| t.key_id == caller.id);
+        let t = t.ok_or_else(|| ApiError::NotFound("unknown or closed tunnel".into()))?;
         Some(t.proxy_server())
     } else {
-        ssrf::check(&parsed, cfg.allow_private_targets)?;
+        ssrf::check(&parsed, cfg.allow_private_targets).await?;
         None
     };
 
-    let req = ShotRequest {
-        url: params.url,
-        width: params.width.unwrap_or(cfg.default_width),
-        height: params.height.unwrap_or(cfg.default_height),
-        scale: params.scale.unwrap_or(1.0),
-        timeout: Duration::from_secs(params.timeout.unwrap_or(cfg.render_timeout_secs)),
-        proxy_server,
-    };
+    let req = ShotRequest { url: params.url, width, height, scale, timeout, proxy_server };
 
     let started = Instant::now();
-    let png = state.chrome.render(&req).await?;
+    let png = state.chrome.render(req.clone()).await?;
     tracing::info!(
         url = %req.url,
         bytes = png.len(),
@@ -142,6 +144,40 @@ pub async fn shot(
     );
 
     Ok(([(header::CONTENT_TYPE, "image/png")], png))
+}
+
+const MAX_DIMENSION: u32 = 4096;
+const SCALE_RANGE: RangeInclusive<f64> = 0.5..=3.0;
+
+fn dimension(name: &str, value: Option<u32>, default: u32) -> Result<u32, ApiError> {
+    match value {
+        None => Ok(default),
+        Some(v) if (1..=MAX_DIMENSION).contains(&v) => Ok(v),
+        Some(v) => {
+            Err(ApiError::BadRequest(format!("{name}={v} out of range 1..={MAX_DIMENSION}")))
+        }
+    }
+}
+
+fn scale(value: Option<f64>) -> Result<f64, ApiError> {
+    match value {
+        None => Ok(1.0),
+        Some(v) if SCALE_RANGE.contains(&v) => Ok(v),
+        Some(v) => Err(ApiError::BadRequest(format!(
+            "scale={v} out of range {}..={}",
+            SCALE_RANGE.start(),
+            SCALE_RANGE.end()
+        ))),
+    }
+}
+
+/// Callers may shorten the render timeout, never extend it past the server's.
+fn timeout(value: Option<u64>, max_secs: u64) -> Result<Duration, ApiError> {
+    match value {
+        None => Ok(Duration::from_secs(max_secs)),
+        Some(v) if (1..=max_secs).contains(&v) => Ok(Duration::from_secs(v)),
+        Some(v) => Err(ApiError::BadRequest(format!("timeout={v} out of range 1..={max_secs}"))),
+    }
 }
 
 /// `GET /tunnel` (WebSocket upgrade). The requester's agent dials this; on
@@ -203,12 +239,18 @@ pub async fn admin_list_keys(
     Ok(Json(state.keys.list()))
 }
 
-/// `POST /admin/keys/{id}/disable`.
+/// `POST /admin/keys/{id}/disable`. Also closes the key's open tunnels.
 pub async fn admin_disable_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(state.keys.set_disabled(&id, true)?))
+    let info = state.keys.set_disabled(&id, true)?;
+    close_revoked_tunnels(&state).await;
+    Ok(Json(info))
+}
+
+pub async fn close_revoked_tunnels(state: &AppState) {
+    state.tunnels.retain_owners(|key_id| state.keys.is_enabled(key_id)).await;
 }
 
 /// `POST /admin/keys/{id}/enable`.
@@ -225,6 +267,7 @@ pub async fn admin_delete_key(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.keys.delete(&id)?;
+    close_revoked_tunnels(&state).await;
     Ok(Json(serde_json::json!({"deleted": id})))
 }
 
@@ -251,6 +294,48 @@ mod tests {
     fn extracts_camelcase_apikey_query_param() {
         let h = HeaderMap::new();
         assert_eq!(extract_key(&h, Some("url=x&apiKey=secret")).as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn dimension_bounds() {
+        assert_eq!(dimension("width", None, 1024).unwrap(), 1024);
+        assert_eq!(dimension("width", Some(1), 1024).unwrap(), 1);
+        assert_eq!(dimension("width", Some(4096), 1024).unwrap(), 4096);
+        assert!(dimension("width", Some(0), 1024).is_err());
+        assert!(dimension("width", Some(4097), 1024).is_err());
+        assert!(dimension("height", Some(100_000), 768).is_err());
+    }
+
+    #[test]
+    fn scale_bounds() {
+        assert!((scale(None).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!(scale(Some(0.5)).is_ok());
+        assert!(scale(Some(3.0)).is_ok());
+        for bad in [0.49, 3.01, 0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(scale(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn timeout_bounds() {
+        assert_eq!(timeout(None, 60).unwrap(), Duration::from_secs(60));
+        assert_eq!(timeout(Some(5), 60).unwrap(), Duration::from_secs(5));
+        assert_eq!(timeout(Some(60), 60).unwrap(), Duration::from_secs(60));
+        assert!(timeout(Some(0), 60).is_err());
+        assert!(timeout(Some(61), 60).is_err());
+        assert!(timeout(Some(86_400), 60).is_err());
+    }
+
+    #[test]
+    fn out_of_range_is_400() {
+        let err = dimension("width", Some(100_000), 1024).unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn health_fails_when_chrome_is_gone() {
+        assert_eq!(health_status(true).0, StatusCode::OK);
+        assert_eq!(health_status(false).0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

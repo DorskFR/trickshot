@@ -80,7 +80,7 @@ pub async fn run(args: &Shot, parsed: &Url) -> Result<()> {
 
     // First frame is the tunnel id.
     let tunnel_id = read_tunnel_id(&mut ws_stream).await?;
-    eprintln!("ts: tunnel open ({tunnel_id})");
+    eprintln!("ts: tunnel open");
 
     // Single writer task owns the sink; everything else sends frames to it.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -204,7 +204,8 @@ async fn serve_stream(
     };
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // target → server: read from the socket, frame as Data.
+    // target → server. On upstream EOF the server must hear about it at once:
+    // Chrome waits for the close on close-delimited responses.
     let up = async move {
         let mut buf = [0u8; 16 * 1024];
         loop {
@@ -217,6 +218,7 @@ async fn serve_stream(
                 }
             }
         }
+        let _ = ws_tx.send(Message::Binary(close_frame(id)));
     };
 
     // server → target: drain the per-stream channel into the socket.
@@ -230,4 +232,43 @@ async fn serve_stream(
     };
 
     tokio::join!(up, down);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn upstream_eof_closes_the_stream_while_server_side_stays_open() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = target.accept().await.unwrap();
+            s.write_all(b"HTTP/1.0 200 OK\r\n\r\nbody").await.unwrap();
+        });
+
+        let (_server_tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<Message>();
+        let stream = tokio::spawn(serve_stream(7, "127.0.0.1".into(), port, rx, ws_tx));
+
+        let mut frames = Vec::new();
+        let close = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(Message::Binary(f)) = ws_rx.recv().await {
+                let done = f[0] == OP_CLOSE;
+                frames.push(f);
+                if done {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(close.is_ok(), "no close frame after upstream EOF");
+        assert_eq!(frames.first().map(|f| f[0]), Some(OP_DATA));
+        assert_eq!(frames.last().unwrap(), &close_frame(7));
+        stream.abort();
+    }
 }

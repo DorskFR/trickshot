@@ -1,4 +1,4 @@
-//! Requester-established reverse tunnels (TRI-5, server side).
+//! Requester-established reverse tunnels (server side).
 //!
 //! A requester who already has VPN/private-network reachability opens a
 //! WebSocket to `GET /tunnel`. The server then binds a *per-tunnel* SOCKS5
@@ -23,17 +23,17 @@
 //! - `0x02` Data  — `[0x02][id:u32][bytes…]`                        (both ways)
 //! - `0x03` Close — `[0x03][id:u32]`                                (both ways)
 //!
-//! The agent (TRI-6, separate ticket) dials `host:port` locally on Open, pipes
+//! The agent (`ts`) dials `host:port` locally on Open, pipes
 //! bytes both ways as Data, and emits Close on EOF/error.
 //!
 //! ## Security
-//! - `/tunnel` requires the same API key as `/shot` (TRI-4); an open tunnel is
+//! - `/tunnel` requires the same API key as `/shot`; an open tunnel is
 //!   itself an SSRF/relay primitive.
 //! - The SOCKS5 listener binds loopback only, so it is never externally
 //!   reachable, and its lifetime is tied to the WebSocket: when the WS drops
 //!   (or idles out) the listener and all streams are torn down and the port is
 //!   freed.
-//! - The direct-path private-IP block (TRI-4) is intentionally *skipped* for
+//! - The private-IP block and egress guard are intentionally *skipped* for
 //!   tunneled shots: reachability is delegated to the requester's own network.
 
 use std::collections::HashMap;
@@ -50,7 +50,9 @@ use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
+
+use crate::socks;
 
 // Wire opcodes.
 const OP_OPEN: u8 = 0x01;
@@ -58,15 +60,21 @@ const OP_DATA: u8 = 0x02;
 const OP_CLOSE: u8 = 0x03;
 
 /// A live tunnel: the loopback SOCKS5 endpoint Chrome should proxy through,
-/// plus the identity of the key that opened it (for attribution).
+/// owned by the key that opened it.
 pub struct Tunnel {
     /// `127.0.0.1:<port>` the per-tunnel SOCKS5 proxy listens on.
     pub socks_addr: SocketAddr,
-    /// Key id that opened the tunnel.
+    /// Key id that opened the tunnel; only that key may use it.
     pub key_id: String,
+    close: watch::Sender<bool>,
 }
 
 impl Tunnel {
+    fn new(socks_addr: SocketAddr, key_id: String) -> (Self, watch::Receiver<bool>) {
+        let (close, closed) = watch::channel(false);
+        (Self { socks_addr, key_id, close }, closed)
+    }
+
     /// The `proxyServer` string to hand a Chrome browser context.
     pub fn proxy_server(&self) -> String {
         format!("socks5://{}", self.socks_addr)
@@ -99,6 +107,27 @@ impl TunnelRegistry {
     async fn remove(&self, id: &str) {
         self.inner.write().await.remove(id);
     }
+
+    /// Close and deregister every tunnel whose owning key no longer passes
+    /// `keep` (disabled or deleted).
+    pub async fn retain_owners(&self, keep: impl Fn(&str) -> bool) {
+        self.inner.write().await.retain(|id, t| {
+            let ok = keep(&t.key_id);
+            if !ok {
+                let _ = t.close.send(true);
+                tracing::info!(tunnel = %log_id(id), key_id = %t.key_id, "tunnel closed: key revoked");
+            }
+            ok
+        });
+    }
+}
+
+/// Short, non-reversible tag for a tunnel id: the id itself is a bearer
+/// capability and must not reach logs.
+pub fn log_id(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(id.as_bytes());
+    format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3])
 }
 
 /// Mint an unguessable tunnel id (128 bits, url-safe base64).
@@ -184,9 +213,9 @@ pub async fn run(
     };
 
     let id = mint_id();
-    let tunnel = Arc::new(Tunnel { socks_addr, key_id: key_id.clone() });
-    registry.insert(id.clone(), tunnel).await;
-    tracing::info!(tunnel_id = %id, socks = %socks_addr, key_id = %key_id, "tunnel open");
+    let (tunnel, closed) = Tunnel::new(socks_addr, key_id.clone());
+    registry.insert(id.clone(), Arc::new(tunnel)).await;
+    tracing::info!(tunnel = %log_id(&id), socks = %socks_addr, key_id = %key_id, "tunnel open");
 
     // Hand the freshly minted id to the agent as the first frame: a single text
     // message `{"tunnel_id":"…"}`. The agent reads it, then issues its shot with
@@ -197,14 +226,14 @@ pub async fn run(
         return;
     }
 
-    let conn = session(socket, listener, cfg.idle_timeout, &id).await;
+    let conn = session(socket, listener, cfg.idle_timeout, closed, &id).await;
 
     // Teardown: deregister and drop all stream channels (which closes the local
     // SOCKS connections). The accept task and listener were owned by `session`
     // and are gone now, freeing the port.
     registry.remove(&id).await;
     conn.streams.lock().await.clear();
-    tracing::info!(tunnel_id = %id, "tunnel closed");
+    tracing::info!(tunnel = %log_id(&id), "tunnel closed");
 }
 
 /// Run the active phase of a tunnel: spawn the SOCKS accept loop and pump the
@@ -214,6 +243,7 @@ async fn session(
     socket: WebSocket,
     listener: TcpListener,
     idle_timeout: Duration,
+    mut closed: watch::Receiver<bool>,
     id: &str,
 ) -> Arc<TunnelConn> {
     let (ws_tx, ws_rx) = socket.split();
@@ -224,8 +254,12 @@ async fn session(
     });
 
     let accept = tokio::spawn(accept_loop(listener, conn.clone()));
-    if let Err(reason) = ws_pump(ws_rx, conn.clone(), idle_timeout).await {
-        tracing::info!(tunnel_id = %id, reason, "tunnel closing");
+    let reason = tokio::select! {
+        r = ws_pump(ws_rx, conn.clone(), idle_timeout) => r.err(),
+        _ = closed.wait_for(|c| *c) => Some("key revoked"),
+    };
+    if let Some(reason) = reason {
+        tracing::info!(tunnel = %log_id(id), reason, "tunnel closing");
     }
     accept.abort();
     conn
@@ -334,52 +368,7 @@ async fn accept_loop(listener: TcpListener, conn: Arc<TunnelConn>) {
 /// Handle one SOCKS5 client (Chrome): negotiate, read the CONNECT target, open
 /// a tunnel stream for it, then pipe bytes both ways over the WebSocket.
 async fn serve_socks(mut stream: TcpStream, conn: Arc<TunnelConn>) -> std::io::Result<()> {
-    // --- SOCKS5 greeting: VER, NMETHODS, METHODS… ---
-    let mut head = [0u8; 2];
-    stream.read_exact(&mut head).await?;
-    if head[0] != 0x05 {
-        return Err(std::io::Error::other("not socks5"));
-    }
-    let nmethods = head[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    stream.read_exact(&mut methods).await?;
-    // Reply: no authentication required (0x00). The proxy is loopback-only.
-    stream.write_all(&[0x05, 0x00]).await?;
-
-    // --- CONNECT request: VER, CMD, RSV, ATYP, ADDR, PORT ---
-    let mut req = [0u8; 4];
-    stream.read_exact(&mut req).await?;
-    if req[1] != 0x01 {
-        // Only CONNECT is supported; reply "command not supported".
-        let _ = reply_socks(&mut stream, 0x07).await;
-        return Err(std::io::Error::other("unsupported socks command"));
-    }
-    let host = match req[3] {
-        0x01 => {
-            let mut a = [0u8; 4];
-            stream.read_exact(&mut a).await?;
-            std::net::Ipv4Addr::from(a).to_string()
-        }
-        0x03 => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await?;
-            let mut name = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut name).await?;
-            String::from_utf8_lossy(&name).into_owned()
-        }
-        0x04 => {
-            let mut a = [0u8; 16];
-            stream.read_exact(&mut a).await?;
-            std::net::Ipv6Addr::from(a).to_string()
-        }
-        _ => {
-            let _ = reply_socks(&mut stream, 0x08).await; // addr type not supported
-            return Err(std::io::Error::other("unsupported socks atyp"));
-        }
-    };
-    let mut port_buf = [0u8; 2];
-    stream.read_exact(&mut port_buf).await?;
-    let port = u16::from_be_bytes(port_buf);
+    let (host, port) = socks::accept(&mut stream).await?;
 
     // Allocate a stream id and a channel for agent→Chrome bytes.
     let stream_id = conn.next_id.fetch_add(1, Ordering::Relaxed);
@@ -389,13 +378,13 @@ async fn serve_socks(mut stream: TcpStream, conn: Arc<TunnelConn>) -> std::io::R
     // Ask the agent to open the connection on its network.
     if !conn.send(TunnelConn::open_frame(stream_id, &host, port)).await {
         conn.streams.lock().await.remove(&stream_id);
-        let _ = reply_socks(&mut stream, 0x01).await; // general failure
+        let _ = socks::reply(&mut stream, socks::GENERAL_FAILURE).await;
         return Err(std::io::Error::other("tunnel websocket gone"));
     }
 
     // We optimistically report success: bytes flow once the agent dials. (A v1
     // tradeoff — there is no per-stream Open-ack in the wire protocol.)
-    reply_socks(&mut stream, 0x00).await?;
+    socks::reply(&mut stream, socks::SUCCEEDED).await?;
 
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -432,12 +421,6 @@ async fn serve_socks(mut stream: TcpStream, conn: Arc<TunnelConn>) -> std::io::R
     Ok(())
 }
 
-/// Write a minimal SOCKS5 reply with the given status and a `0.0.0.0:0` BND
-/// address (clients ignore the bound address for CONNECT).
-async fn reply_socks(stream: &mut TcpStream, status: u8) -> std::io::Result<()> {
-    stream.write_all(&[0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,8 +451,36 @@ mod tests {
 
     #[test]
     fn proxy_server_string() {
-        let t = Tunnel { socks_addr: "127.0.0.1:5000".parse().unwrap(), key_id: "k1".into() };
+        let (t, _) = Tunnel::new("127.0.0.1:5000".parse().unwrap(), "k1".into());
         assert_eq!(t.proxy_server(), "socks5://127.0.0.1:5000");
+    }
+
+    #[tokio::test]
+    async fn revoking_owner_closes_and_deregisters_its_tunnels() {
+        let reg = TunnelRegistry::new();
+        let (a, mut a_closed) = Tunnel::new("127.0.0.1:1".parse().unwrap(), "alice".into());
+        let (b, b_closed) = Tunnel::new("127.0.0.1:2".parse().unwrap(), "bob".into());
+        reg.insert("ta".into(), Arc::new(a)).await;
+        reg.insert("tb".into(), Arc::new(b)).await;
+
+        reg.retain_owners(|k| k != "alice").await;
+
+        assert!(reg.get("ta").await.is_none());
+        assert!(reg.get("tb").await.is_some());
+        tokio::time::timeout(Duration::from_secs(1), a_closed.wait_for(|c| *c))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!*b_closed.borrow());
+    }
+
+    #[test]
+    fn log_id_does_not_reveal_the_id() {
+        let id = "Zm9vYmFyYmF6cXV4cXV1eA";
+        let tag = log_id(id);
+        assert_eq!(tag.len(), 8);
+        assert!(!id.contains(&tag));
+        assert_eq!(tag, log_id(id));
     }
 
     #[test]
