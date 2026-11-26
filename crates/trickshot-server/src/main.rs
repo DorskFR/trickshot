@@ -3,9 +3,11 @@
 
 mod chrome;
 mod config;
+mod egress;
 mod error;
 mod handlers;
 mod keys;
+mod socks;
 mod ssrf;
 mod tunnel;
 
@@ -23,6 +25,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::chrome::{Chrome, ChromeConfig};
 use crate::config::{Cli, Cmd, Config};
+use crate::egress::EgressGuard;
 use crate::keys::{KeyStore, Role};
 use crate::tunnel::TunnelRegistry;
 
@@ -32,6 +35,7 @@ pub struct AppState {
     pub chrome: Arc<Chrome>,
     pub keys: Arc<KeyStore>,
     pub tunnels: Arc<TunnelRegistry>,
+    _egress: EgressGuard,
 }
 
 #[tokio::main]
@@ -59,17 +63,20 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let keys = setup_keys(&config)?;
 
+    let egress = EgressGuard::start(egress::policy(config.allow_private_targets)).await?;
     let chrome_cfg = ChromeConfig {
         bin: config.chrome_bin.clone(),
         width: config.default_width,
         height: config.default_height,
         max_concurrency: config.chrome_max_concurrency,
+        sandbox: !config.chrome_no_sandbox,
+        egress_proxy: egress.proxy_server(),
     };
     let chrome = Chrome::start(&chrome_cfg).await?;
 
     let bind = config.bind.clone();
     let tunnels = TunnelRegistry::new();
-    let state = Arc::new(AppState { config, chrome, keys, tunnels });
+    let state = Arc::new(AppState { config, chrome, keys, tunnels, _egress: egress });
 
     let app = build_router(state);
 

@@ -19,9 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       fontconfig fonts-liberation fonts-noto-cjk libfreetype6 \
     && rm -rf /var/lib/apt/lists/*
 
+RUN useradd --system --uid 65532 --user-group --create-home --home-dir /home/trickshot trickshot \
+    && install -d -o 65532 -g 65532 /data
+
 COPY --from=builder /app/target/release/trickshot /usr/local/bin/trickshot
 
 ENV TRICKSHOT_BIND=0.0.0.0:8900 \
     TRICKSHOT_CHROME_BIN=/usr/bin/chromium
 EXPOSE 8900
+USER 65532:65532
 CMD ["trickshot"]

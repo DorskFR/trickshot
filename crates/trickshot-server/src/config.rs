@@ -74,6 +74,11 @@ pub struct Config {
     #[arg(long, env = "TRICKSHOT_ALLOW_PRIVATE_TARGETS", default_value_t = false)]
     pub allow_private_targets: bool,
 
+    /// Disable Chromium's sandbox. Only for hosts where unprivileged user
+    /// namespaces are unavailable to the process.
+    #[arg(long, env = "TRICKSHOT_CHROME_NO_SANDBOX", default_value_t = false)]
+    pub chrome_no_sandbox: bool,
+
     /// Max concurrent reverse tunnels (`/tunnel`); further upgrades are
     /// rejected. Each tunnel binds one loopback SOCKS5 listener.
     #[arg(long, env = "TRICKSHOT_MAX_TUNNELS", default_value_t = 16)]

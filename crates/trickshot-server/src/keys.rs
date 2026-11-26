@@ -417,10 +417,11 @@ mod tests {
     use super::*;
 
     fn store() -> Arc<KeyStore> {
-        let dir = std::env::temp_dir().join(format!("trickshot-keys-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("trickshot-keys-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join(format!("keys-{:?}.json", std::time::Instant::now()));
-        KeyStore::load(path).unwrap()
+        KeyStore::load(dir.join("keys.json")).unwrap()
     }
 
     #[test]

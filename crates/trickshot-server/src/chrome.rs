@@ -29,8 +29,8 @@ pub struct ShotRequest {
     /// Device pixel ratio (DPR). 1.0 = standard, 2.0 = crisp "retina" 2x render.
     pub scale: f64,
     pub timeout: Duration,
-    /// Optional per-context proxy (e.g. `socks5://127.0.0.1:NNNN`) routing this
-    /// shot's traffic through a reverse tunnel (TRI-5). `None` = direct egress.
+    /// Reverse-tunnel proxy (e.g. `socks5://127.0.0.1:NNNN`) for this shot.
+    /// `None` routes through the egress guard.
     pub proxy_server: Option<String>,
 }
 
@@ -45,7 +45,16 @@ pub struct ChromeConfig {
     pub height: u32,
     /// Max number of pages rendering concurrently in the one browser.
     pub max_concurrency: usize,
+    /// Keep Chromium's sandbox on. Off only where user namespaces are
+    /// unavailable (e.g. a host with AppArmor userns restrictions).
+    pub sandbox: bool,
+    /// Egress guard proxy every non-tunnel connection goes through.
+    pub egress_proxy: String,
 }
+
+/// Chrome skips the proxy for loopback and link-local targets unless told
+/// otherwise; this removes that implicit bypass.
+const PROXY_BYPASS: &str = "<-loopback>";
 
 /// A long-lived headless Chrome instance plus the background task that drives
 /// its CDP connection.
@@ -56,25 +65,26 @@ pub struct Chrome {
     handler: JoinHandle<()>,
     /// Bounds how many pages render at once.
     permits: Arc<Semaphore>,
+    egress_proxy: String,
 }
 
 impl Chrome {
     /// Launch the browser and start its event-handler loop. Returns once Chrome
     /// is up and the DevTools connection is live.
     pub async fn start(cfg: &ChromeConfig) -> Result<Arc<Self>, ApiError> {
+        // chromiumoxide prepends `--` to each arg itself.
         let mut builder = BrowserConfig::builder()
             .window_size(cfg.width, cfg.height)
-            // Run unsandboxed so Chromium starts as root in the container; this
-            // emits `--no-sandbox --disable-setuid-sandbox` for us.
-            .no_sandbox()
-            // Container-friendly flags; headless is chromiumoxide's default.
-            // NOTE: chromiumoxide takes bare arg keys (no leading `--`); it
-            // stores the string verbatim and later prepends `--`, so passing
-            // `--foo` here would emit the bogus flag `----foo` and be ignored.
             .arg("disable-dev-shm-usage")
             .arg("disable-gpu")
             .arg("hide-scrollbars")
-            .arg("force-color-profile=srgb");
+            .arg("force-color-profile=srgb")
+            .arg(("proxy-server", cfg.egress_proxy.as_str()))
+            .arg(("proxy-bypass-list", PROXY_BYPASS))
+            .arg(("force-webrtc-ip-handling-policy", "disable_non_proxied_udp"));
+        if !cfg.sandbox {
+            builder = builder.no_sandbox();
+        }
         if let Some(bin) = &cfg.bin {
             builder = builder.chrome_executable(bin);
         }
@@ -95,11 +105,12 @@ impl Chrome {
             tracing::error!("chrome handler stream ended; browser connection lost");
         });
 
-        tracing::info!(max_concurrency = cfg.max_concurrency, "chrome warm");
+        tracing::info!(max_concurrency = cfg.max_concurrency, sandbox = cfg.sandbox, "chrome warm");
         Ok(Arc::new(Self {
             browser,
             handler,
             permits: Arc::new(Semaphore::new(cfg.max_concurrency)),
+            egress_proxy: cfg.egress_proxy.clone(),
         }))
     }
 
@@ -123,16 +134,14 @@ impl Chrome {
     }
 
     async fn render_inner(&self, url: &Url, req: &ShotRequest) -> Result<Vec<u8>, ApiError> {
-        // Create an isolated browser context for this shot. When `proxy_server`
-        // is set (a reverse tunnel, TRI-5), Chrome forces all of this context's
-        // traffic — DNS included, since SOCKS5 resolves at the proxy — through
-        // it, without touching the warm browser's global config. The context is
-        // always disposed before returning, freeing its cookies/cache.
-        let mut ctx_params = CreateBrowserContextParams::builder();
-        if let Some(proxy) = &req.proxy_server {
-            ctx_params = ctx_params.proxy_server(proxy.clone());
-        }
-        let ctx_params = ctx_params.build();
+        // One isolated context per shot, always disposed before returning. All
+        // of its traffic, DNS included (SOCKS5 resolves at the proxy), goes
+        // through the tunnel or the egress guard.
+        let proxy = req.proxy_server.as_deref().unwrap_or(&self.egress_proxy);
+        let ctx_params = CreateBrowserContextParams::builder()
+            .proxy_server(proxy)
+            .proxy_bypass_list(PROXY_BYPASS)
+            .build();
         let ctx_id = self
             .browser
             .create_browser_context(ctx_params)
@@ -191,5 +200,118 @@ impl Chrome {
             return Err(ApiError::Render("empty screenshot".into()));
         }
         Ok(png)
+    }
+}
+
+#[cfg(test)]
+mod e2e {
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::egress::{EgressGuard, Policy};
+
+    const INTERNAL: [u8; 4] = [127, 0, 0, 2];
+
+    async fn http_server(
+        ip: [u8; 4],
+        respond: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> SocketAddr {
+        let l = TcpListener::bind((IpAddr::from(ip), 0)).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let _ = s.write_all(respond(&path).as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Chromium binary in TRICKSHOT_TEST_CHROME"]
+    async fn guard_blocks_redirects_subresources_and_workers() {
+        let bin = std::env::var("TRICKSHOT_TEST_CHROME").expect("TRICKSHOT_TEST_CHROME");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let internal = http_server(INTERNAL, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            ok("internal-secret")
+        })
+        .await;
+        let target = format!("http://{internal}/");
+        let public = http_server([127, 0, 0, 1], move |path| match path {
+            "/redirect" => format!(
+                "HTTP/1.1 302 Found\r\nlocation: {target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+            "/worker.js" => format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/javascript\r\nconnection: close\r\n\r\nfetch('{target}w').catch(()=>{{}});"
+            ),
+            _ => ok(&format!(
+                "<iframe src='{target}f'></iframe><img src='{target}i'>\
+                 <script>fetch('{target}x').catch(()=>{{}});new Worker('/worker.js');</script>"
+            )),
+        })
+        .await;
+
+        let block = Arc::new(AtomicBool::new(false));
+        let flag = block.clone();
+        let policy: Policy =
+            Arc::new(move |ip| flag.load(Ordering::SeqCst) && ip == IpAddr::from(INTERNAL));
+        let guard = EgressGuard::start(policy).await.unwrap();
+        let chrome = Chrome::start(&ChromeConfig {
+            bin: Some(bin),
+            width: 800,
+            height: 600,
+            max_concurrency: 1,
+            sandbox: std::env::var("TRICKSHOT_TEST_CHROME_SANDBOX").is_ok(),
+            egress_proxy: guard.proxy_server(),
+        })
+        .await
+        .unwrap();
+
+        let render_all = || async {
+            hits.store(0, Ordering::SeqCst);
+            for path in ["/redirect", "/page"] {
+                let req = ShotRequest {
+                    url: format!("http://{public}{path}"),
+                    width: 800,
+                    height: 600,
+                    scale: 1.0,
+                    timeout: Duration::from_secs(20),
+                    proxy_server: None,
+                };
+                let res = chrome.render(&req).await;
+                eprintln!("{path}: {:?}", res.map(|png| png.len()));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            hits.load(Ordering::SeqCst)
+        };
+
+        let control = render_all().await;
+        eprintln!("internal hits without block: {control}");
+        assert!(control >= 4, "control run should reach the internal host, got {control}");
+
+        block.store(true, Ordering::SeqCst);
+        let blocked = render_all().await;
+        eprintln!("internal hits with block: {blocked}");
+        assert_eq!(blocked, 0);
     }
 }

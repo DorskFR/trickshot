@@ -1,4 +1,4 @@
-//! Requester-established reverse tunnels (TRI-5, server side).
+//! Requester-established reverse tunnels (server side).
 //!
 //! A requester who already has VPN/private-network reachability opens a
 //! WebSocket to `GET /tunnel`. The server then binds a *per-tunnel* SOCKS5
@@ -23,17 +23,17 @@
 //! - `0x02` Data  — `[0x02][id:u32][bytes…]`                        (both ways)
 //! - `0x03` Close — `[0x03][id:u32]`                                (both ways)
 //!
-//! The agent (TRI-6, separate ticket) dials `host:port` locally on Open, pipes
+//! The agent (`ts`) dials `host:port` locally on Open, pipes
 //! bytes both ways as Data, and emits Close on EOF/error.
 //!
 //! ## Security
-//! - `/tunnel` requires the same API key as `/shot` (TRI-4); an open tunnel is
+//! - `/tunnel` requires the same API key as `/shot`; an open tunnel is
 //!   itself an SSRF/relay primitive.
 //! - The SOCKS5 listener binds loopback only, so it is never externally
 //!   reachable, and its lifetime is tied to the WebSocket: when the WS drops
 //!   (or idles out) the listener and all streams are torn down and the port is
 //!   freed.
-//! - The direct-path private-IP block (TRI-4) is intentionally *skipped* for
+//! - The private-IP block and egress guard are intentionally *skipped* for
 //!   tunneled shots: reachability is delegated to the requester's own network.
 
 use std::collections::HashMap;
@@ -51,6 +51,8 @@ use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
+
+use crate::socks;
 
 // Wire opcodes.
 const OP_OPEN: u8 = 0x01;
@@ -334,52 +336,7 @@ async fn accept_loop(listener: TcpListener, conn: Arc<TunnelConn>) {
 /// Handle one SOCKS5 client (Chrome): negotiate, read the CONNECT target, open
 /// a tunnel stream for it, then pipe bytes both ways over the WebSocket.
 async fn serve_socks(mut stream: TcpStream, conn: Arc<TunnelConn>) -> std::io::Result<()> {
-    // --- SOCKS5 greeting: VER, NMETHODS, METHODS… ---
-    let mut head = [0u8; 2];
-    stream.read_exact(&mut head).await?;
-    if head[0] != 0x05 {
-        return Err(std::io::Error::other("not socks5"));
-    }
-    let nmethods = head[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    stream.read_exact(&mut methods).await?;
-    // Reply: no authentication required (0x00). The proxy is loopback-only.
-    stream.write_all(&[0x05, 0x00]).await?;
-
-    // --- CONNECT request: VER, CMD, RSV, ATYP, ADDR, PORT ---
-    let mut req = [0u8; 4];
-    stream.read_exact(&mut req).await?;
-    if req[1] != 0x01 {
-        // Only CONNECT is supported; reply "command not supported".
-        let _ = reply_socks(&mut stream, 0x07).await;
-        return Err(std::io::Error::other("unsupported socks command"));
-    }
-    let host = match req[3] {
-        0x01 => {
-            let mut a = [0u8; 4];
-            stream.read_exact(&mut a).await?;
-            std::net::Ipv4Addr::from(a).to_string()
-        }
-        0x03 => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await?;
-            let mut name = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut name).await?;
-            String::from_utf8_lossy(&name).into_owned()
-        }
-        0x04 => {
-            let mut a = [0u8; 16];
-            stream.read_exact(&mut a).await?;
-            std::net::Ipv6Addr::from(a).to_string()
-        }
-        _ => {
-            let _ = reply_socks(&mut stream, 0x08).await; // addr type not supported
-            return Err(std::io::Error::other("unsupported socks atyp"));
-        }
-    };
-    let mut port_buf = [0u8; 2];
-    stream.read_exact(&mut port_buf).await?;
-    let port = u16::from_be_bytes(port_buf);
+    let (host, port) = socks::accept(&mut stream).await?;
 
     // Allocate a stream id and a channel for agent→Chrome bytes.
     let stream_id = conn.next_id.fetch_add(1, Ordering::Relaxed);
@@ -389,13 +346,13 @@ async fn serve_socks(mut stream: TcpStream, conn: Arc<TunnelConn>) -> std::io::R
     // Ask the agent to open the connection on its network.
     if !conn.send(TunnelConn::open_frame(stream_id, &host, port)).await {
         conn.streams.lock().await.remove(&stream_id);
-        let _ = reply_socks(&mut stream, 0x01).await; // general failure
+        let _ = socks::reply(&mut stream, socks::GENERAL_FAILURE).await;
         return Err(std::io::Error::other("tunnel websocket gone"));
     }
 
     // We optimistically report success: bytes flow once the agent dials. (A v1
     // tradeoff — there is no per-stream Open-ack in the wire protocol.)
-    reply_socks(&mut stream, 0x00).await?;
+    socks::reply(&mut stream, socks::SUCCEEDED).await?;
 
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -430,12 +387,6 @@ async fn serve_socks(mut stream: TcpStream, conn: Arc<TunnelConn>) -> std::io::R
     tokio::join!(up, down);
     conn.streams.lock().await.remove(&stream_id);
     Ok(())
-}
-
-/// Write a minimal SOCKS5 reply with the given status and a `0.0.0.0:0` BND
-/// address (clients ignore the bound address for CONNECT).
-async fn reply_socks(stream: &mut TcpStream, status: u8) -> std::io::Result<()> {
-    stream.write_all(&[0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
 }
 
 #[cfg(test)]
