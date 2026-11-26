@@ -39,7 +39,7 @@ jobs:
             target: aarch64-unknown-linux-musl
           - os: darwin
             arch: arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6
